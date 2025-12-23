@@ -1,10 +1,24 @@
 import json
 import torch
 import argparse
-import numpy as np
 from tqdm import tqdm
 from transformers import RobertaTokenizer
 from models import ANCE
+
+
+def encode_text(text, tokenizer, model, device, max_len):
+    inputs = tokenizer(
+        text,
+        truncation=True,
+        max_length=max_len,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.no_grad():
+        emb = model(**inputs)          # [1, dim]
+        emb = emb.squeeze(0).cpu()     # [dim]
+
+    return emb
 
 
 def main(args):
@@ -14,50 +28,56 @@ def main(args):
     model = ANCE.from_pretrained(args.encoder_path).to(device)
     model.eval()
 
-    doc_embeddings = {}
-    doc_id_map = {}
+    # Final table: sample_id -> {pos, neg, oracle}
+    sample_embeddings = {}
 
     with open(args.dataset_file, "r", encoding="utf-8") as f:
-        for line in tqdm(f, desc="Encoding documents"):
+        for line in tqdm(f, desc="Encoding pos / neg / oracle embeddings"):
             record = json.loads(line)
-
-            # collect pos + neg docs
-            docs = []
-            if "pos_docs" in record:
-                docs.append(record["pos_docs"][0])
-            if "bm25_hard_neg_docs" in record:
-                docs.extend(record["bm25_hard_neg_docs"][0])
-            if "oracle_utt_text" in record:
-                docs.append(record["oracle_utt_text"])
-            
             sample_id = record["sample_id"]
 
-            for doc_text in docs:
-                if doc_text in doc_id_map:
-                    continue
+            entry = {}
 
-                inputs = tokenizer(
-                    doc_text,
-                    truncation=True,
-                    padding=False,
-                    max_length=args.max_doc_length,
-                    return_tensors="pt",
-                ).to(device)
+            # --------
+            # Positive document (must exist)
+            # --------
+            pos_text = record["pos_docs"][0]
+            entry["pos"] = encode_text(
+                pos_text, tokenizer, model, device, args.max_doc_length
+            )
 
-                with torch.no_grad():
-                    emb = model(**inputs)
-                    emb = emb.squeeze(0).cpu().numpy()
+            # --------
+            # Negative document (optional)
+            # --------
+            if "bm25_hard_neg_docs" in record and len(record["bm25_hard_neg_docs"]) > 0:
+                neg_text = record["bm25_hard_neg_docs"][0]
+                entry["neg"] = encode_text(
+                    neg_text, tokenizer, model, device, args.max_doc_length
+                )
+            else:
+                entry["neg"] = None
 
-                doc_id_map[doc_text] = sample_id
-                doc_embeddings[sample_id] = emb
-                print(emb.shape)
-                exit()
+            # --------
+            # Oracle utterance (optional)
+            # --------
+            if "oracle_utt_text" in record:
+                entry["oracle"] = encode_text(
+                    record["oracle_utt_text"],
+                    tokenizer,
+                    model,
+                    device,
+                    args.max_doc_length
+                )
+            else:
+                entry["oracle"] = None
 
-    # save
-    np.save(args.output_embedding_file, doc_embeddings)
-    json.dump(doc_id_map, open(args.output_id_map_file, "w"))
+            sample_embeddings[sample_id] = entry
 
-    print(f"Saved {len(doc_embeddings)} document embeddings.")
+    # Save as a single torch file (recommended)
+    torch.save(sample_embeddings, args.output_embedding_file)
+
+    print(f"Saved embeddings for {len(sample_embeddings)} samples.")
+    print(f"Output file: {args.output_embedding_file}")
 
 
 if __name__ == "__main__":
@@ -65,7 +85,6 @@ if __name__ == "__main__":
     parser.add_argument("--encoder_path", type=str, required=True)
     parser.add_argument("--dataset_file", type=str, required=True)
     parser.add_argument("--output_embedding_file", type=str, required=True)
-    parser.add_argument("--output_id_map_file", type=str, required=True)
     parser.add_argument("--max_doc_length", type=int, default=512)
 
     args = parser.parse_args()
@@ -73,9 +92,9 @@ if __name__ == "__main__":
 
 ### Example usage:
 '''
- python encode_pos_neg_docs.py \
-     --encoder_path /data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234" \
-     --dataset_file /data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl \
-     --output_embedding_file /data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/topiocqa_pos_neg_docs_ance/embeddings.pt \
-     --max_doc_length 512  
+python encode_pos_neg_docs.py \
+--encoder_path /data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234 \
+--dataset_file /data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl \
+--output_embedding_file /data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/topiocqa_pos_neg_docs_ance/embeddings.pt \
+--max_doc_length 512
 '''
