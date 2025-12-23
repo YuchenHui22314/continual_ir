@@ -202,19 +202,19 @@ class Topiocqa(Dataset):
                 oracle_mask = torch.zeros((B, 1), dtype=torch.long)
 
             return {
-                "bt_sample_ids": sample_ids,
+                "sample_ids": sample_ids,
 
-                "bt_conv_qa": conv_padded,
-                "bt_conv_qa_mask": conv_mask,
+                "complex_query": conv_padded,
+                "complex_query_mask": conv_mask,
 
-                "bt_pos_docs": pos_padded,
-                "bt_pos_docs_mask": pos_mask,
+                "pos_docs": pos_padded,
+                "pos_docs_mask": pos_mask,
 
-                "bt_neg_docs": neg_padded,
-                "bt_neg_docs_mask": neg_mask,
+                "neg_docs": neg_padded,
+                "neg_docs_mask": neg_mask,
 
-                "bt_oracle_labels": oracle_padded,
-                "bt_oracle_labels_mask": oracle_mask,
+                "oracle_qr": oracle_padded,
+                "oracle_qr_mask": oracle_mask,
             }
 
         return collate_fn

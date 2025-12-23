@@ -26,10 +26,10 @@ from models import ANCE
 from utils import check_dir_exist_or_build, set_seed, get_optimizer
 from data import Topiocqa 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 
-def save_model(model_output_path, model, query_tokenizer, optimizer, scheduler, cur_step, best_loss):
+def save_model(model_output_path, model, query_tokenizer, optimizer, scheduler, cur_step, cur_epoch, best_loss):
     """
     Save a full training checkpoint including:
       - Model weights
@@ -69,6 +69,7 @@ def save_model(model_output_path, model, query_tokenizer, optimizer, scheduler, 
     # This file stores metadata about training progress (e.g., step, best loss)
     torch.save({
         "step": cur_step,
+        "epoch": cur_epoch,
         "best_loss": best_loss,
     }, oj(output_dir, "trainer_state.pt"))
 
@@ -101,13 +102,6 @@ def cal_ranking_loss(query_embs, pos_doc_embs, neg_doc_embs):
     return loss
 
 def train(args):
-    #if not args.need_output:
-    #    args.log_path = "./tmp"
-    #if dist.get_rank() == 0:
-    #    check_dir_exist_or_build([args.log_path], args.force_emptying_dir)
-        #log_writer = SummaryWriter(log_dir = args.log_path)
-    #else:
-    #    log_writer = None
 
     # 1. Load query and doc encoders
     config = RobertaConfig.from_pretrained(args.pretrained_encoder_path)
@@ -176,7 +170,10 @@ def train(args):
 
         # 1) Load model weights
         model_to_load = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
-        query_encoder = model_to_load.from_pretrained(ckpt).to(args.device)
+        model_to_load.load_state_dict(
+            torch.load(os.path.join(ckpt, "pytorch_model.bin"))
+        )
+
 
         # 2) Load optimizer and scheduler states
         optimizer.load_state_dict(torch.load(os.path.join(ckpt, "optimizer.pt")))
@@ -194,56 +191,65 @@ def train(args):
         best_loss = float("inf")
 
 
-    # For each Epoch
+    ######################################
+    #### Main Training Loop: For each Epoch
+    ######################################
+
     epoch_iterator = trange(args.num_train_epochs, desc="Epoch")
     for epoch in epoch_iterator:
+
         # yuchen: only train query encoder, freeze doc encoder
         query_encoder.train()
         passage_encoder.eval()
+
         # yuchen: necessary to make the distribution of samples correct
         if args.n_gpu > 1:
             train_loader.sampler.set_epoch(epoch)
 
         for batch in tqdm(train_loader,  desc="Step"):
-            # yuchen: or optimizer.zero_grad()
-            query_encoder.zero_grad()
-            bt_concat = batch['bt_input_ids'].to(args.device) 
-            bt_concat_mask = batch['bt_attention_mask'].to(args.device)
-            concat_embs = query_encoder(bt_concat, bt_concat_mask)  # B * dim
             
-            #if args.loss_type == "kd":
-            #    oracle_query_encoder.eval()
-            #    bt_oracle_utt = batch["bt_oracle_utt"].to(args.device)
-            #    bt_oracle_utt_mask = batch["bt_oracle_utt_mask"].to(args.device)
-            #    with torch.no_grad():
-                # freeze oracle query encoder's parameters
-            #        oracle_utt_embs = oracle_query_encoder(bt_oracle_utt, bt_oracle_utt_mask).detach()  # B * dim
-            #    loss = cal_kd_loss(concat_embs, oracle_utt_embs)
-            #elif args.loss_type == "ranking":
-            bt_pos_docs = batch['bt_pos_docs'].to(args.device)
-            bt_pos_docs_mask = batch['bt_pos_docs_mask'].to(args.device)
-            bt_neg_docs = batch['bt_neg_docs'].to(args.device)
+            #########################
+            ### Take inputs
+            #########################
+            
+            complex_query = batch['complex_query'].to(args.device) 
+            complex_query_mask = batch['complex_query_mask'].to(args.device)
+
+            pos_docs = batch['pos_docs'].to(args.device)
+            pos_docs_mask = batch['pos_docs_mask'].to(args.device)
 
             # yuchen: in DPR paper, it is shown that only one BM25 hard negative can be helpful, while two do not help further.
-            bt_neg_docs_mask = batch['bt_neg_docs_mask'].to(args.device)
+            neg_docs = batch['neg_docs'].to(args.device)
+            neg_docs_mask = batch['bt_neg_docs_mask'].to(args.device)
+            
+            if "kd" in args.loss_type: 
+                oracle_query = batch['bt_oracle_labels'].to(args.device)
+                oracle_query_mask = batch['bt_oracle_labels_mask'].to(args.device)
 
-            bt_oracle_query = batch['bt_oracle_labels'].to(args.device)
-            bt_oracle_query_mask = batch['bt_oracle_labels_mask'].to(args.device)
+
+            complex_query_embs = query_encoder(complex_query, complex_query_mask)  # B * dim
+            # yuchen: or optimizer.zero_grad()
+            query_encoder.zero_grad()
+
+            #########################
+            ### calcualte embeddings. 
+            #########################
+
             with torch.no_grad():
             # doc encoder's parameters are frozen
-                pos_doc_embs = passage_encoder(bt_pos_docs, bt_pos_docs_mask).detach()  # B * dim
-                oracle_utt_embs = passage_encoder(bt_oracle_query, bt_oracle_query_mask).detach()
-                if len(batch['bt_neg_docs']) == 0:  # only_in_batch negative
-                    neg_doc_embs = None
-                else:
-                    #batch_size, neg_ratio, seq_len = bt_neg_docs.shape       
-                    #bt_neg_docs = bt_neg_docs.view(batch_size * neg_ratio, seq_len)        
-                    #bt_neg_docs_mask = bt_neg_docs_mask.view(batch_size * neg_ratio, seq_len)             
-                    neg_doc_embs = passage_encoder(bt_neg_docs, bt_neg_docs_mask).detach()  # (B * neg_ratio) * dim,      
+                pos_doc_embs = passage_encoder(pos_docs, pos_docs_mask).detach()  # B * dim
+                neg_doc_embs = passage_encoder(neg_docs, neg_docs_mask).detach()  # (B * neg_ratio) * dim,      
 
-            ranking_loss = cal_ranking_loss(concat_embs, pos_doc_embs, neg_doc_embs)
-            kd_loss = cal_kd_loss(concat_embs, oracle_utt_embs)
-            loss = ranking_loss + kd_loss
+                if "kd" in args.loss_type:
+                    oracle_utt_embs = passage_encoder(oracle_query, oracle_query_mask).detach()
+
+            ranking_loss = cal_ranking_loss(complex_query_embs, pos_doc_embs, neg_doc_embs)
+            if "kd" in args.loss_type:
+                kd_loss = cal_kd_loss(complex_query_embs, oracle_utt_embs)
+                loss = ranking_loss + kd_loss
+            else:
+                loss = ranking_loss
+
             loss.backward()
             # grad norm should be done after loss.backward and before optimizer.step
             torch.nn.utils.clip_grad_norm_(query_encoder.parameters(), args.max_grad_norm)
@@ -261,7 +267,6 @@ def train(args):
             #if dist.get_rank() == 0:
             #    log_writer.add_scalar("train_{}_loss".format(args.loss_type), loss, cur_step)
             cur_step += 1    # avoid saving the model of the first step.
-            dist.barrier()
             # Save model
             if dist.get_rank() == 0 and best_loss > loss:
                 save_model(
@@ -271,6 +276,7 @@ def train(args):
                     optimizer,
                     scheduler,
                     cur_step,
+                    epoch,
                     best_loss
                 )
                 
@@ -283,6 +289,8 @@ def train(args):
                             )
                 best_loss = loss
 
+        # for each "epoch", wait for all processes to finish
+        dist.barrier()
     logger.info("Training finish!")          
     #if dist.get_rank() == 0:   
     #    log_writer.close()
@@ -294,25 +302,17 @@ def get_args():
     parser.add_argument('--local-rank', type=int, default=-1, metavar='N', help='Local process rank.')  # is useful if using python -m torch.distributed.luanch xxxxx 
 
     parser.add_argument('--n_gpu', type=int, default=4, help='The number of used GPU.')
-    parser.add_argument("--pretrained_encoder_path", type=str, default="checkpoints/ad-hoc-ance-msmarco")
+    parser.add_argument("--pretrained_encoder_path", type=str, default="/data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234")
     parser.add_argument( "--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory to resume training from")
-    parser.add_argument("--training_data_file", type=str, default="datasets/topiocqa/topiocqa_train.json")
-    parser.add_argument("--model_output_path", type=str, default="output/models")
-    parser.add_argument("--oracle_file", type=str, default="") # file with oracle rewrite
-    parser.add_argument("--rewrite_file", type=str, default=None)
-    parser.add_argument("--GRF_file", type=str, default="") # file with generative relevant feedback
-    parser.add_argument("--with_original", type=bool, default=False)
-    parser.add_argument("--rewrite_shuffle", type=bool, default=False)
-    parser.add_argument("--rewrite_nums", type=int, default=5)
-    parser.add_argument("--GRF_nums", type=int, default=1)
+    parser.add_argument("--training_data_file", type=str, default="/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl")
+    parser.add_argument("--pos_neg_embedding_file", type=str, default="/data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/topiocqa_pos_neg_docs_ance/embeddings.npy")
+    parser.add_argument("--model_output_path", type=str, default="/data/rech/huiyuche/huggingface/continual_ir/topiocqa")
 
-    parser.add_argument("--log_print_steps", type=float, default=1000, help="Percent of steps per epoch to print once.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--use_data_percent", type=float, default=1.0, help="Percent of samples to use. Faciliating the debugging.")
+    parser.add_argument("--loss_type", type=str, default="ranking", help="The type of loss to use. Options: kd, kd+ranking, ranking")
     parser.add_argument("--num_train_epochs", type=int, default=20, help="num_train_epochs")
     parser.add_argument("--per_gpu_train_batch_size", type=int,  default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight_decay")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="weight_decay")
     parser.add_argument("--adam_epsilon", type=float, default=1e-8, help="adam epsilon")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm.")
 
@@ -322,14 +322,15 @@ def get_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.06, help="Warm up ratio w.r.t total training steps.")
 
 
-    parser.add_argument("--max_query_length", type=int, default=512, help="Max single query length")
+    # complementary settings
+    parser.add_argument("--log_print_steps", type=float, default=1000, help="Percent of steps per epoch to print once.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--use_data_percent", type=float, default=1.0, help="Percent of samples to use. Faciliating the debugging.")
+    parser.add_argument("--max_query_length", type=int, default=64, help="Max single query length")
     parser.add_argument("--max_doc_length", type=int, default=512, help="Max doc length, consistent with \"Dialog inpainter\".")
     parser.add_argument("--max_response_length", type=int, default=64)
     parser.add_argument("--max_concat_length", type=int, default=512)
 
-    parser.add_argument("--loss_type", type=str, default="ranking")
-    parser.add_argument("--collate_fn_type", type=str, default="flat_concat_for_train", help="To control how to organize the batch data.")
-    #parser.add_argument("--neg_ratio", type=int, help="negative ratio")
 
     args = parser.parse_args()
 
