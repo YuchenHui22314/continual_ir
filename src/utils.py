@@ -121,6 +121,12 @@ def get_optimizer(args, model: nn.Module, weight_decay: float = 0.0, ) -> torch.
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     return optimizer
 
+def optimizer_to(optim, device):
+    for state in optim.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
 
 
 class StreamingDataset(IterableDataset):

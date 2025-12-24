@@ -1,29 +1,36 @@
 import logging
+
+from jax import grad
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 import sys
+import argparse
+
 sys.path.append('..')
 sys.path.append('.')
+
 import time
-import numpy as np
-import argparse
+import os
 from os.path import join as oj
+
+import numpy as np
+
 from tqdm import tqdm, trange
 
-import torch, os
+import torch
 from torch import nn
 from torch.utils.data import DataLoader, RandomSampler
-#from tensorboardX import SummaryWriter
-from transformers import get_linear_schedule_with_warmup
-
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+
+from transformers import get_linear_schedule_with_warmup
 from transformers import RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer
 
+import wandb
+
 from models import ANCE
-from utils import check_dir_exist_or_build, set_seed, get_optimizer
+from utils import check_dir_exist_or_build, set_seed, get_optimizer, optimizer_to
 from data import Topiocqa 
 
 #os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
@@ -130,7 +137,7 @@ def train(args):
     if args.pos_neg_embedding_file is None:
         passage_encoder = ANCE.from_pretrained(args.pretrained_encoder_path, config=config).to(args.device)
 
-    query_encoder = DDP(query_encoder, device_ids = [args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+    query_encoder = DDP(query_encoder, device_ids = [args.local_rank], output_device=args.local_rank, find_unused_parameters=True) # TODO: verify this..
 
     if args.n_gpu > 1:
         dist.barrier()
@@ -176,6 +183,12 @@ def train(args):
     ###|_____/             \______> training steps
     ###      ↑
     ###   warmup ending
+
+    if is_main_process:
+        logger.info("num warmup steps: {}".format(int(args.warmup_ratio * total_training_steps)))
+        if args.save_to_wandb:
+            wandb.config.update({"num_warmup_steps": int(args.warmup_ratio * total_training_steps)})
+        
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = int(args.warmup_ratio * total_training_steps), num_training_steps=total_training_steps)
 
 
@@ -200,6 +213,7 @@ def train(args):
 
         # 2) Load optimizer and scheduler states
         optimizer.load_state_dict(torch.load(os.path.join(ckpt, "optimizer.pt"),map_location="cpu"))
+        optimizer_to(optimizer, args.device)
         scheduler.load_state_dict(torch.load(os.path.join(ckpt, "scheduler.pt"),map_location="cpu"))
 
         # 3) Load trainer state (global step, best loss)
@@ -304,6 +318,8 @@ def train(args):
 
 
             ranking_loss = cal_ranking_loss(complex_query_embs, pos_doc_embs, neg_doc_embs)
+
+            kd_loss = torch.tensor(0.0) 
             if "kd" in args.loss_type:
                 kd_loss = cal_kd_loss(complex_query_embs, oracle_utt_embs)
                 loss = ranking_loss + kd_loss
@@ -312,12 +328,15 @@ def train(args):
 
             loss.backward()
             # grad norm should be done after loss.backward and before optimizer.step
-            torch.nn.utils.clip_grad_norm_(query_encoder.parameters(), args.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(query_encoder.parameters(), args.max_grad_norm)
             optimizer.step()
             # after each step(batch), update the learning rate
             scheduler.step()
             
             loss = loss.item()
+            ranking_loss = ranking_loss.item()
+            kd_loss = kd_loss.item()
+            grad_norm = grad_norm.item()
 
             # print info
             if is_main_process and cur_step % args.log_print_steps == 0:
@@ -327,31 +346,47 @@ def train(args):
                     total_training_steps,
                     round(loss, 7))
                     )
+                if args.save_to_wandb:
+                    wandb.log(
+                        {
+                            "train/loss": loss,
+                            "train/ranking_loss": ranking_loss,
+                            "train/kd_loss": kd_loss,
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "train/grad_norm": grad_norm,
+                            "epoch": epoch,
+                        },
+                        step=cur_step
+                    )
             #if dist.get_rank() == 0:
             #    log_writer.add_scalar("train_{}_loss".format(args.loss_type), loss, cur_step)
             cur_step += 1    # avoid saving the model of the first step.
-            # Save model
-            if is_main_process and best_loss > loss:
-                save_model(
-                    args,
-                    args.model_output_path,
-                    query_encoder,
-                    query_tokenizer,
-                    optimizer,
-                    scheduler,
-                    cur_step,
-                    epoch,
-                    loss
-                )
-                best_loss = loss
-                
+        # end for: each batch
 
+        # for each epoch, save model
+        if is_main_process and best_loss > loss:
+            save_model(
+                args,
+                args.model_output_path,
+                query_encoder,
+                query_tokenizer,
+                optimizer,
+                scheduler,
+                cur_step,
+                epoch,
+                loss
+            )
+            best_loss = loss
+            if args.save_to_wandb:
+                wandb.run.summary["best_loss"] = loss
+                
         # for each "epoch", wait for all processes to finish
         if args.n_gpu > 1:
             dist.barrier()
+
     logger.info("Training finish!")          
-    #if dist.get_rank() == 0:   
-    #    log_writer.close()
+    if is_main_process and args.save_to_wandb:   
+       wandb.finish()
        
 
 def get_args():
@@ -375,12 +410,13 @@ def get_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm.")
 
     # yuchen: probably problematic
-    parser.add_argument("--num_warmup_steps", type=int, default=0.06, help="Warm up steps.")
+    #parser.add_argument("--num_warmup_steps", type=int, default=0.06, help="Warm up steps.")
     # yuchen: I will use this. 
     parser.add_argument("--warmup_ratio", type=float, default=0.06, help="Warm up ratio w.r.t total training steps.")
 
 
     # complementary settings
+
     parser.add_argument("--log_print_ratio", type=float, default=0.1, help="Percent of steps per epoch to print once.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use_data_percent", type=float, default=1.0, help="Percent of samples to use. Faciliating the debugging.")
@@ -389,6 +425,9 @@ def get_args():
     parser.add_argument("--max_response_length", type=int, default=64)
     parser.add_argument("--max_concat_length", type=int, default=512)
 
+    parser.add_argument("--save_to_wandb", action="store_true", help="if we will save the results to wandb.")
+    parser.add_argument("--wandb_project", type=str, default="topiocqa-ance")
+    parser.add_argument("--wandb_name", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -426,8 +465,17 @@ def get_args():
 
 if __name__ == '__main__':
     args = get_args()
-    set_seed(args)
+    is_main_process = (args.n_gpu == 1) or (dist.get_rank() == 0)
 
+    if is_main_process and args.save_to_wandb:
+        wandb.init(
+            project=args.wandb_project, 
+            name=args.wandb_name,
+            resume = "allow"
+            )
+        wandb.config.update(vars(args))
+
+    set_seed(args)
     train(args)
 
 # python  -m torch.distributed.launch --nproc_per_node 2 xxx.py

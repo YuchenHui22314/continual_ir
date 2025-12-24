@@ -49,7 +49,7 @@ torchrun \
   --pos_neg_embedding_file "${POS_NEG_EMB}" \
   --loss_type ranking \
   --num_train_epochs 20 \
-  --per_gpu_train_batch_size 64 \
+  --per_gpu_train_batch_size 128 \
   --learning_rate 1e-5 \
   --weight_decay 0.00 \
   --warmup_ratio 0.06 \
@@ -57,7 +57,10 @@ torchrun \
   --max_doc_length 512 \
   --max_concat_length 512 \
   --log_print_ratio 0.1 \
-  --use_data_percent 0.01 &>> $LOG_PATH
+  --save_to_wandb \
+  --wandb_project "continual_ir" \
+  --wandb_name "finetune_ance_topiocqa" \
+  --use_data_percent 1.0 &>> $LOG_PATH
 
 
 # --resume_from_checkpoint

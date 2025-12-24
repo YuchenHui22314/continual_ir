@@ -57,46 +57,95 @@ class Topiocqa(Dataset):
                 oracle_utt_tokens = []
             
 
+            # We reserve 1 position for [CLS] at the beginning
+            max_context_len = args.max_concat_length - 1
+            flat_concat = []
+            total_len = 0
+
             # build current utterance tokens
             cur_utt_tokens = self.tokenize(cur_utt_text, max_len=args.max_query_length)
 
-            # build context utterance tokens
-            flat_concat = []
-            flat_concat.append(cur_utt_tokens[1:]) # remove [CLS]
-            total_length = len(flat_concat[0]) 
-
-
             # goal of this code segement: build the conversation context as:
             # [cls,q1,sep,r1,sep,q2,sep,r2,sep,...,qn,sep,rn,sep]
+
+            # ---- 1. Add current utterance first (most recent) ----
+            cur_tokens = cur_utt_tokens[1:]  # remove [CLS], keep [SEP]
+
+            if len(cur_tokens) > max_context_len:
+                cur_tokens = cur_tokens[:max_context_len]
+                cur_tokens[-1] = self.tokenizer.sep_token_id
+
+            flat_concat.append(cur_tokens)
+            total_len += len(cur_tokens)
+
+            # ---- 2. Add historical utterances backward ----
             for j in range(len(ctx_utts_text) - 1, -1, -1):
 
-                # odd index : response, even index: query 
+                # odd index : response, even index : query
                 if j % 2 == 1:
                     max_length = args.max_response_length
                 else:
                     max_length = args.max_query_length
 
-                # with [cls] and [sep]
-                cls_context = self.tokenize( ctx_utts_text[j], max_len=max_length)
-                context = cls_context[1:]  # remove [CLS]
+                # tokenize with special tokens, then remove [CLS]
+                tokens = self.tokenize(ctx_utts_text[j], max_len=max_length)
+                tokens = tokens[1:]  # remove [CLS], keep trailing [SEP]
 
-                remaining = args.max_concat_length - total_length
-
-                if len(context) > remaining:
-                    if remaining > 2:
-                        flat_concat.append(context[:remaining - 2] + [self.tokenizer.sep_token_id])
+                remaining = max_context_len - total_len
+                if remaining <= 0:
                     break
+
+                if len(tokens) <= remaining:
+                    flat_concat.append(tokens)
+                    total_len += len(tokens)
                 else:
-                    flat_concat.append(context)
-                    total_length += len(context)
-            
-            # begin from the earliest turn
-            flat_concat = flat_concat[::-1]  # reverse to make the order correct
-            # [token..., SEP, token..., SEP, ..., token..., SEP]
-            flat_concat = [token_id for turn in flat_concat for token_id in turn]
-            # add [CLS] at the beginning
+                    # need to truncate tokens, but must end with [SEP]
+                    truncated = tokens[:remaining]
+                    truncated[-1] = self.tokenizer.sep_token_id
+                    flat_concat.append(truncated)
+                    total_len += len(truncated)
+                    break
+
+            # ---- 3. Restore chronological order ----
+            flat_concat = flat_concat[::-1]
+
+            # ---- 4. Flatten and prepend [CLS] ----
+            flat_concat = [tok for turn in flat_concat for tok in turn]
             flat_tokens = [self.tokenizer.cls_token_id]
             flat_tokens.extend(flat_concat)
+
+            # HARD SAFETY CHECK (debug only, can remove later)
+            assert len(flat_tokens) <= args.max_concat_length
+
+            # for j in range(len(ctx_utts_text) - 1, -1, -1):
+
+            #     # odd index : response, even index: query 
+            #     if j % 2 == 1:
+            #         max_length = args.max_response_length
+            #     else:
+            #         max_length = args.max_query_length
+
+            #     # with [cls] and [sep]
+            #     cls_context = self.tokenize( ctx_utts_text[j], max_len=max_length)
+            #     context = cls_context[1:]  # remove [CLS]
+
+            #     remaining = args.max_concat_length - total_length
+
+            #     if len(context) >= remaining:
+            #         if remaining > 2:
+            #             flat_concat.append(context[:remaining - 2] + [self.tokenizer.sep_token_id])
+            #         break
+            #     else:
+            #         flat_concat.append(context)
+            #         total_length += len(context)
+            
+            # # begin from the earliest turn
+            # flat_concat = flat_concat[::-1]  # reverse to make the order correct
+            # # [token..., SEP, token..., SEP, ..., token..., SEP]
+            # flat_concat = [token_id for turn in flat_concat for token_id in turn]
+            # # add [CLS] at the beginning
+            # flat_tokens = [self.tokenizer.cls_token_id]
+            # flat_tokens.extend(flat_concat)
 
             self.examples.append(
                 {
