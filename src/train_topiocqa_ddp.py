@@ -317,19 +317,20 @@ def train(args):
             # after each step(batch), update the learning rate
             scheduler.step()
             
+            loss = loss.item()
+
             # print info
             if is_main_process and cur_step % args.log_print_steps == 0:
                 logger.info("Epoch = {}, Current Step = {}, Total Step = {}, Loss = {}".format(
                     epoch,
                     cur_step,
                     total_training_steps,
-                    round(loss.item(), 7))
+                    round(loss, 7))
                     )
             #if dist.get_rank() == 0:
             #    log_writer.add_scalar("train_{}_loss".format(args.loss_type), loss, cur_step)
             cur_step += 1    # avoid saving the model of the first step.
             # Save model
-            loss = loss.item()
             if is_main_process and best_loss > loss:
                 save_model(
                     args,
@@ -342,14 +343,8 @@ def train(args):
                     epoch,
                     loss
                 )
+                best_loss = loss
                 
-                # save_model(args.model_output_path, query_encoder, query_tokenizer) 
-                logger.info("Epoch = {}, Current Step = {}, Total Step = {}, Loss = {}".format(
-                                epoch,
-                                cur_step,
-                                total_training_steps,
-                                round(loss.item(), 7))
-                            )
 
         # for each "epoch", wait for all processes to finish
         if args.n_gpu > 1:

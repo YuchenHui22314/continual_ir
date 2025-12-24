@@ -83,8 +83,8 @@ class Topiocqa(Dataset):
                 remaining = args.max_concat_length - total_length
 
                 if len(context) > remaining:
-                    if remaining > 1:
-                        flat_concat.append(context[:remaining - 1] + [self.tokenizer.sep_token_id])
+                    if remaining > 2:
+                        flat_concat.append(context[:remaining - 2] + [self.tokenizer.sep_token_id])
                     break
                 else:
                     flat_concat.append(context)
