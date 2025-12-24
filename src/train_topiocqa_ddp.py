@@ -29,7 +29,7 @@ from data import Topiocqa
 #os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 
-def save_model(model_output_path, model, query_tokenizer, optimizer, scheduler, cur_step, cur_epoch, best_loss):
+def save_model(args, model_output_path, model, query_tokenizer, optimizer, scheduler, cur_step, cur_epoch, best_loss):
     """
     Save a full training checkpoint including:
       - Model weights
@@ -76,41 +76,64 @@ def save_model(model_output_path, model, query_tokenizer, optimizer, scheduler, 
     logger.info(f"Saved checkpoint at {output_dir}")
 
 
-# def save_model(model_output_path, model, query_tokenizer):
-
-#     output_dir = oj(args.model_output_path, 'test_topiocqa')
-#     #check_dir_exist_or_build([output_dir])
-#     os.makedirs(output_dir, exist_ok=True)
-#     model_to_save = model.module if hasattr(model, 'module') else model
-#     model_to_save.save_pretrained(output_dir)
-#     query_tokenizer.save_pretrained(output_dir)
-#     logger.info("Save checkpoint at {}".format(output_dir))
-
-
 def cal_kd_loss(query_embs, oracle_query_embs):
     loss_func = nn.MSELoss()
     return loss_func(query_embs, oracle_query_embs)
 
-def cal_ranking_loss(query_embs, pos_doc_embs, neg_doc_embs):
-    batch_size = len(query_embs)
-    pos_scores = query_embs.mm(pos_doc_embs.T)  # B * B
-    neg_scores = torch.sum(query_embs * neg_doc_embs, dim = 1).unsqueeze(1) # B * 1 hard negatives
-    score_mat = torch.cat([pos_scores, neg_scores], dim = 1)    # B * (B + 1)  in_batch negatives + 1 BM25 hard negative 
-    label_mat = torch.arange(batch_size).to(args.device) # B
-    loss_func = nn.CrossEntropyLoss()
-    loss = loss_func(score_mat, label_mat)
-    return loss
+def cal_ranking_loss(query_embs, pos_doc_embs, neg_doc_embs=None):
+    # get batch size
+    batch_size = query_embs.size(0)
+
+    # relevance scores: B * B
+    pos_scores = query_embs @ pos_doc_embs.T  # [B, B]
+
+    if neg_doc_embs is not None:
+        # B * 1 hard negative scores
+        neg_scores = torch.sum(query_embs * neg_doc_embs, dim=1, keepdim=True) 
+        # B * (B + 1), scores = in_batch negatives + 1 BM25 hard negative
+        score_mat = torch.cat([pos_scores, neg_scores], dim=1)
+    else:
+        score_mat = pos_scores
+
+    # where exist the positive documents (the diagonal elements)
+    labels = torch.arange(batch_size, device=query_embs.device)
+
+    return nn.CrossEntropyLoss()(score_mat, labels)
+
 
 def train(args):
+    # -1 
+    is_main_process = (args.n_gpu == 1) or (dist.get_rank() == 0)
+
+    # 0. load pre-encoded pos, neg, oracle embeddings if any
+    if args.pos_neg_embedding_file is not None:
+        # dict: sample_id -> (pos_emb, neg_emb, oracle_emb)
+        sample_emb_table = torch.load(
+            args.pos_neg_embedding_file,
+            map_location= "cpu"
+            ) 
+
+        '''
+        sample_id_1": {
+            "pos":    Tensor[dim],
+            "neg":    Tensor[dim] | None,
+            "oracle": Tensor[dim] | None
+        },
+    '''
 
     # 1. Load query and doc encoders
     config = RobertaConfig.from_pretrained(args.pretrained_encoder_path)
     query_tokenizer = RobertaTokenizer.from_pretrained(args.pretrained_encoder_path, do_lower_case=True)
     query_encoder = ANCE.from_pretrained(args.pretrained_encoder_path, config=config).to(args.device)
-    passage_encoder = ANCE.from_pretrained(args.pretrained_encoder_path, config=config).to(args.device)
+
+    # if we did not encode the pos neg and oracle embeddings beforehand
+    if args.pos_neg_embedding_file is None:
+        passage_encoder = ANCE.from_pretrained(args.pretrained_encoder_path, config=config).to(args.device)
 
     query_encoder = DDP(query_encoder, device_ids = [args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-    dist.barrier()
+
+    if args.n_gpu > 1:
+        dist.barrier()
 
     # 2. Prepare training data
     train_dataset = Topiocqa(
@@ -135,7 +158,8 @@ def train(args):
         batch_size=args.per_gpu_train_batch_size, 
         sampler=sampler, 
         collate_fn=train_dataset.get_collate_fn(args, query_tokenizer.pad_token_id),
-        drop_last = True
+        drop_last = True,
+        pin_memory=True
         )
 
     total_training_steps = args.num_train_epochs * (len(train_dataset) // args.batch_size + int(bool(len(train_dataset) % args.batch_size)))
@@ -143,7 +167,7 @@ def train(args):
     # 3. optimizer
     optimizer = get_optimizer(args, query_encoder, weight_decay=args.weight_decay)
 
-    # 4. warmup: yuchen: warm up steps should usually be set to 0.06* total steps
+    # 4. warmup: yuchen: warm up steps should usually be set to 0.06* total steps. 
     ###Learning rate
     ###^
     ###|        /\
@@ -162,7 +186,7 @@ def train(args):
     logger.info("Total training steps = {}".format(total_training_steps))
     num_steps_per_epoch = total_training_steps // args.num_train_epochs
     logger.info("Num steps per epoch = {}".format(num_steps_per_epoch))
-    args.log_print_steps = max(1, int(args.log_print_steps * num_steps_per_epoch))
+    args.log_print_steps = max(1, int(args.log_print_ratio * num_steps_per_epoch))
 
     # if we want to resume
     if args.resume_from_checkpoint is not None:
@@ -171,36 +195,41 @@ def train(args):
         # 1) Load model weights
         model_to_load = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
         model_to_load.load_state_dict(
-            torch.load(os.path.join(ckpt, "pytorch_model.bin"))
+            torch.load(os.path.join(ckpt, "pytorch_model.bin"),map_location="cpu")
         )
 
-
         # 2) Load optimizer and scheduler states
-        optimizer.load_state_dict(torch.load(os.path.join(ckpt, "optimizer.pt")))
-        scheduler.load_state_dict(torch.load(os.path.join(ckpt, "scheduler.pt")))
+        optimizer.load_state_dict(torch.load(os.path.join(ckpt, "optimizer.pt"),map_location="cpu"))
+        scheduler.load_state_dict(torch.load(os.path.join(ckpt, "scheduler.pt"),map_location="cpu"))
 
         # 3) Load trainer state (global step, best loss)
-        state = torch.load(os.path.join(ckpt, "trainer_state.pt"))
+        state = torch.load(os.path.join(ckpt, "trainer_state.pt"), map_location="cpu")
         cur_step = state["step"]
         best_loss = state["best_loss"]
+        epoch = state["epoch"]
+        start_epoch = epoch + 1  # next epoch to run
 
         logger.info(f"Resumed from checkpoint {ckpt}: step={cur_step}, best_loss={best_loss}")
 
     else:
         cur_step = 0
+        start_epoch = 0
         best_loss = float("inf")
 
 
     ######################################
     #### Main Training Loop: For each Epoch
     ######################################
+    epoch_iterator = trange(
+        start_epoch,
+        args.num_train_epochs,
+        desc="Epoch"
+    )
 
-    epoch_iterator = trange(args.num_train_epochs, desc="Epoch")
     for epoch in epoch_iterator:
 
         # yuchen: only train query encoder, freeze doc encoder
         query_encoder.train()
-        passage_encoder.eval()
 
         # yuchen: necessary to make the distribution of samples correct
         if args.n_gpu > 1:
@@ -211,37 +240,68 @@ def train(args):
             #########################
             ### Take inputs
             #########################
-            
-            complex_query = batch['complex_query'].to(args.device) 
-            complex_query_mask = batch['complex_query_mask'].to(args.device)
+            sample_ids = batch['sample_ids']  # B
 
-            pos_docs = batch['pos_docs'].to(args.device)
-            pos_docs_mask = batch['pos_docs_mask'].to(args.device)
+            complex_query = batch['complex_query'].to(args.device, non_blocking=True) 
+            complex_query_mask = batch['complex_query_mask'].to(args.device, non_blocking=True)
 
-            # yuchen: in DPR paper, it is shown that only one BM25 hard negative can be helpful, while two do not help further.
-            neg_docs = batch['neg_docs'].to(args.device)
-            neg_docs_mask = batch['bt_neg_docs_mask'].to(args.device)
-            
-            if "kd" in args.loss_type: 
-                oracle_query = batch['bt_oracle_labels'].to(args.device)
-                oracle_query_mask = batch['bt_oracle_labels_mask'].to(args.device)
-
+            # yuchen: or optimizer.zero_grad()
+            # query_encoder.zero_grad()
+            optimizer.zero_grad()
 
             complex_query_embs = query_encoder(complex_query, complex_query_mask)  # B * dim
-            # yuchen: or optimizer.zero_grad()
-            query_encoder.zero_grad()
 
-            #########################
-            ### calcualte embeddings. 
-            #########################
 
-            with torch.no_grad():
-            # doc encoder's parameters are frozen
-                pos_doc_embs = passage_encoder(pos_docs, pos_docs_mask).detach()  # B * dim
-                neg_doc_embs = passage_encoder(neg_docs, neg_docs_mask).detach()  # (B * neg_ratio) * dim,      
+            ###############################
+            ### calcualte (get) embeddings. 
+            ###############################
+
+            # if not pre-encoded, encode on the fly
+            if args.pos_neg_embedding_file is None:
+
+                pos_docs = batch['pos_docs'].to(args.device, non_blocking=True)
+                pos_docs_mask = batch['pos_docs_mask'].to(args.device, non_blocking=True)
+
+                # yuchen: in DPR paper, it is shown that only one BM25 hard negative can be helpful, while two do not help further.
+                neg_docs = batch['neg_docs'].to(args.device, non_blocking=True)
+                neg_docs_mask = batch['neg_docs_mask'].to(args.device, non_blocking=True)
+            
+                if "kd" in args.loss_type: 
+                    oracle_query = batch['oracle_qr'].to(args.device, non_blocking=True)
+                    oracle_query_mask = batch['oracle_qr_mask'].to(args.device, non_blocking=True)
+                passage_encoder.eval()
+                with torch.no_grad():
+                # doc encoder's parameters are frozen
+                    pos_doc_embs = passage_encoder(pos_docs, pos_docs_mask).detach()  # B * dim
+                    neg_doc_embs = passage_encoder(neg_docs, neg_docs_mask).detach()  # (B * neg_ratio) * dim,      
+
+                    if "kd" in args.loss_type:
+                        oracle_utt_embs = passage_encoder(oracle_query, oracle_query_mask).detach()
+
+            else: # if we have pre-encoded pos, neg, oracle embeddings
+
+                pos_doc_embs = torch.stack(
+                    [sample_emb_table[sid]["pos"] for sid in sample_ids],
+                    dim=0
+                ).to(args.device)   # [B, dim]
+
+                if sample_emb_table[sample_ids[0]]["neg"] is not None:
+                    neg_doc_embs = torch.stack(
+                        [sample_emb_table[sid]["neg"] for sid in sample_ids],
+                        dim=0
+                    ).to(args.device)
+                else:
+                    neg_doc_embs = None
+
 
                 if "kd" in args.loss_type:
-                    oracle_utt_embs = passage_encoder(oracle_query, oracle_query_mask).detach()
+                    oracle_utt_embs = torch.stack(
+                        [sample_emb_table[sid]["oracle"] for sid in sample_ids],
+                        dim=0
+                    ).to(args.device)
+            
+            # end if: pre-encoded pos neg oracle embeddings
+
 
             ranking_loss = cal_ranking_loss(complex_query_embs, pos_doc_embs, neg_doc_embs)
             if "kd" in args.loss_type:
@@ -254,10 +314,11 @@ def train(args):
             # grad norm should be done after loss.backward and before optimizer.step
             torch.nn.utils.clip_grad_norm_(query_encoder.parameters(), args.max_grad_norm)
             optimizer.step()
+            # after each step(batch), update the learning rate
             scheduler.step()
             
             # print info
-            if dist.get_rank() == 0 and cur_step % args.log_print_steps == 0:
+            if is_main_process and cur_step % args.log_print_steps == 0:
                 logger.info("Epoch = {}, Current Step = {}, Total Step = {}, Loss = {}".format(
                     epoch,
                     cur_step,
@@ -268,8 +329,10 @@ def train(args):
             #    log_writer.add_scalar("train_{}_loss".format(args.loss_type), loss, cur_step)
             cur_step += 1    # avoid saving the model of the first step.
             # Save model
-            if dist.get_rank() == 0 and best_loss > loss:
+            loss = loss.item()
+            if is_main_process and best_loss > loss:
                 save_model(
+                    args,
                     args.model_output_path,
                     query_encoder,
                     query_tokenizer,
@@ -277,7 +340,7 @@ def train(args):
                     scheduler,
                     cur_step,
                     epoch,
-                    best_loss
+                    loss
                 )
                 
                 # save_model(args.model_output_path, query_encoder, query_tokenizer) 
@@ -287,10 +350,10 @@ def train(args):
                                 total_training_steps,
                                 round(loss.item(), 7))
                             )
-                best_loss = loss
 
         # for each "epoch", wait for all processes to finish
-        dist.barrier()
+        if args.n_gpu > 1:
+            dist.barrier()
     logger.info("Training finish!")          
     #if dist.get_rank() == 0:   
     #    log_writer.close()
@@ -305,25 +368,25 @@ def get_args():
     parser.add_argument("--pretrained_encoder_path", type=str, default="/data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234")
     parser.add_argument( "--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory to resume training from")
     parser.add_argument("--training_data_file", type=str, default="/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl")
-    parser.add_argument("--pos_neg_embedding_file", type=str, default="/data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/topiocqa_pos_neg_docs_ance/embeddings.npy")
+    parser.add_argument("--pos_neg_embedding_file", type=str, default=None)#"/data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/topiocqa_pos_neg_docs_ance/embeddings.npy")
     parser.add_argument("--model_output_path", type=str, default="/data/rech/huiyuche/huggingface/continual_ir/topiocqa")
 
     parser.add_argument("--loss_type", type=str, default="ranking", help="The type of loss to use. Options: kd, kd+ranking, ranking")
     parser.add_argument("--num_train_epochs", type=int, default=20, help="num_train_epochs")
     parser.add_argument("--per_gpu_train_batch_size", type=int,  default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="weight_decay")
+    parser.add_argument("--weight_decay", type=float, default=0.00, help="weight_decay")
     parser.add_argument("--adam_epsilon", type=float, default=1e-8, help="adam epsilon")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm.")
 
     # yuchen: probably problematic
-    parser.add_argument("--num_warmup_steps", type=int, default=0.1, help="Warm up steps.")
+    parser.add_argument("--num_warmup_steps", type=int, default=0.06, help="Warm up steps.")
     # yuchen: I will use this. 
     parser.add_argument("--warmup_ratio", type=float, default=0.06, help="Warm up ratio w.r.t total training steps.")
 
 
     # complementary settings
-    parser.add_argument("--log_print_steps", type=float, default=1000, help="Percent of steps per epoch to print once.")
+    parser.add_argument("--log_print_ratio", type=float, default=0.1, help="Percent of steps per epoch to print once.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use_data_percent", type=float, default=1.0, help="Percent of samples to use. Faciliating the debugging.")
     parser.add_argument("--max_query_length", type=int, default=64, help="Max single query length")

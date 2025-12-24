@@ -66,6 +66,8 @@ class Topiocqa(Dataset):
             total_length = len(flat_concat[0]) 
 
 
+            # goal of this code segement: build the conversation context as:
+            # [cls,q1,sep,r1,sep,q2,sep,r2,sep,...,qn,sep,rn,sep]
             for j in range(len(ctx_utts_text) - 1, -1, -1):
 
                 # odd index : response, even index: query 
@@ -106,7 +108,6 @@ class Topiocqa(Dataset):
                 }
             )
 
-            print(self.examples)
 
     
     def __len__(self):
