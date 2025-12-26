@@ -1,4 +1,7 @@
 import sys
+from typing import Dict, List, Any, Optional
+
+from tqdm import tqdm
 
 sys.path += ['../']
 import torch
@@ -65,3 +68,117 @@ class ANCE(RobertaForSequenceClassification):
     def forward(self, input_ids, attention_mask, wrap_pooler=False):
         return self.query_emb(input_ids, attention_mask)
 
+
+
+class BeirEvalANCEQueryEncoder:
+    def __init__(
+        self,
+        query_encoder: Any,
+        query_encoder_tokenizer: Any,
+        device: Optional[torch.device],
+        max_length_query: int = 512,
+        max_length_doc: int = 512,
+    ):
+        """
+        Asymmetric ANCE encoder:
+        - one encoder for queries
+
+        Args:
+            query_encoder (Any): Query encoder model
+            query_encoder_tokenizer (Any): Query encoder tokenizer
+            max_length_query (int): max length for query encoding
+            max_length_doc (int): max length for document encoding
+        """
+        self.device = device or torch.device("cpu")
+        self.max_length_query = max_length_query
+        self.max_length_doc = max_length_doc
+
+        # -------------------------
+        # Query encoder
+        # -------------------------
+        self.query_tokenizer = query_encoder_tokenizer
+        self.query_encoder = query_encoder
+        self.query_encoder.eval()
+
+
+    def encode_queries(
+        self,
+        queries: List[str],
+        batch_size: int,
+        **kwargs,
+    ) -> np.ndarray:
+        """
+        Encode queries using the query encoder.
+        """
+        embeddings = []
+        with torch.no_grad():
+            for i in tqdm(
+                range(0, len(queries), batch_size),
+                desc="Encoding Queries (Asymmetric)",
+            ):
+                batch = queries[i : i + batch_size]
+                encoded = self.query_tokenizer(
+                    batch,
+                    max_length=self.max_length_query,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+                dense = self.query_encoder(
+                    input_ids=encoded["input_ids"],
+                    attention_mask=encoded["attention_mask"],
+                )
+
+                dense = F.normalize(dense, p=2, dim=-1)
+                embeddings.append(dense.cpu().numpy())
+
+        return np.concatenate(embeddings, axis=0)
+
+    def encode_corpus(
+        self,
+        corpus: List[Dict[str, str]],
+        batch_size: int,
+        **kwargs,
+    ) -> np.ndarray:
+        """
+        Encode documents using the passage encoder.
+        """
+        # BEIR-style preprocessing: title + text
+        texts = []
+        for doc in corpus:
+            title = doc.get("title", "").strip()
+            text = doc.get("text", "").strip()
+            if title and text:
+                texts.append(f"{title} {text}")
+            elif title:
+                texts.append(title)
+            else:
+                texts.append(text)
+
+        embeddings = []
+        with torch.no_grad():
+            for i in tqdm(
+                range(0, len(texts), batch_size),
+                desc="Encoding Corpus (Asymmetric)",
+            ):
+                batch = texts[i : i + batch_size]
+                encoded = self.passage_tokenizer(
+                    batch,
+                    max_length=self.max_length_doc,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+                dense = self.passage_encoder(
+                    input_ids=encoded["input_ids"],
+                    attention_mask=encoded["attention_mask"],
+                )
+
+                dense = F.normalize(dense, p=2, dim=-1)
+                embeddings.append(dense.cpu().numpy())
+
+        return np.concatenate(embeddings, axis=0)

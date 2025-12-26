@@ -30,8 +30,10 @@ MASTER_PORT=29501   # you can change this port if needed.
 ############################
 ENCODER_PATH="/data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234"
 TRAIN_FILE="/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl"
-OUTPUT_DIR="/data/rech/huiyuche/huggingface/continual_ir/topiocqa"
+OUTPUT_DIR="/data/rech/huiyuche/huggingface/continual_ir/topiocqa_120bs_beir"
 POS_NEG_EMB="/data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/topiocqa_pos_neg_docs_ance/embeddings.pt"
+BEIR_EMB_DIR="/data/rech/huiyuche/beir/embeddings/ance/"
+BEIR_QUERY_CORPUS_PATH="/data/rech/huiyuche/beir"
 
 LOG_PATH="/data/rech/huiyuche/TREC_iKAT_2024/logs/train_log_topiocqa.txt"
 
@@ -49,7 +51,7 @@ torchrun \
   --pos_neg_embedding_file "${POS_NEG_EMB}" \
   --loss_type ranking \
   --num_train_epochs 20 \
-  --per_gpu_train_batch_size 128 \
+  --per_gpu_train_batch_size 120 \
   --learning_rate 1e-5 \
   --weight_decay 0.00 \
   --warmup_ratio 0.06 \
@@ -59,7 +61,11 @@ torchrun \
   --log_print_ratio 0.1 \
   --save_to_wandb \
   --wandb_project "continual_ir" \
-  --wandb_name "finetune_ance_topiocqa" \
+  --wandb_name "topiocqa_bs_120_beir" \
+  --beir_embedding_dir "${BEIR_EMB_DIR}" \
+  --eval_batch_size 64 \
+  --beir_datasets climate-fever msmarco \
+  --beir_query_corpus_path "${BEIR_QUERY_CORPUS_PATH}" \
   --use_data_percent 1.0 &>> $LOG_PATH
 
 

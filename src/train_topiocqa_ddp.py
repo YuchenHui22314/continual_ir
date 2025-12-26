@@ -1,6 +1,5 @@
 import logging
 
-from jax import grad
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 import sys
@@ -13,7 +12,7 @@ import time
 import os
 from os.path import join as oj
 
-import numpy as np
+import gc
 
 from tqdm import tqdm, trange
 
@@ -24,13 +23,14 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
+
 from transformers import get_linear_schedule_with_warmup
-from transformers import RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer
+from transformers import RobertaConfig, RobertaTokenizer
 
 import wandb
 
 from models import ANCE
-from utils import check_dir_exist_or_build, set_seed, get_optimizer, optimizer_to
+from utils import eval_beir_datasets, set_seed, get_optimizer, optimizer_to
 from data import Topiocqa 
 
 #os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
@@ -50,37 +50,45 @@ def save_model(args, model_output_path, model, query_tokenizer, optimizer, sched
 
     # Create a unique directory per checkpoint (e.g., by step)
     output_dir = oj(model_output_path, f"checkpoint-step-{cur_step}")
-    os.makedirs(output_dir, exist_ok=True)
 
-    # ====== Save model and tokenizer ======
+    # if exit, skip
+    if os.path.exists(output_dir):
+        logger.info(f"Checkpoint {output_dir} already exists, skipping save.")
+        return
 
-    # If model is wrapped in DistributedDataParallel, unwrap it
-    model_to_save = model.module if hasattr(model, "module") else model
+    else:
 
-    # Save the model in HuggingFace format
-    model_to_save.save_pretrained(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
 
-    # Save the tokenizer as well
-    query_tokenizer.save_pretrained(output_dir)
+        # ====== Save model and tokenizer ======
 
-    # ====== Save optimizer and scheduler states ======
+        # If model is wrapped in DistributedDataParallel, unwrap it
+        model_to_save = model.module if hasattr(model, "module") else model
 
-    # Optimizer state is required to resume training with momentum/Adam states
-    torch.save(optimizer.state_dict(), oj(output_dir, "optimizer.pt"))
+        # Save the model in HuggingFace format
+        model_to_save.save_pretrained(output_dir)
 
-    # Scheduler state is required to resume the learning rate schedule
-    torch.save(scheduler.state_dict(), oj(output_dir, "scheduler.pt"))
+        # Save the tokenizer as well
+        query_tokenizer.save_pretrained(output_dir)
 
-    # ====== Save training state info ======
+        # ====== Save optimizer and scheduler states ======
 
-    # This file stores metadata about training progress (e.g., step, best loss)
-    torch.save({
-        "step": cur_step,
-        "epoch": cur_epoch,
-        "best_loss": best_loss,
-    }, oj(output_dir, "trainer_state.pt"))
+        # Optimizer state is required to resume training with momentum/Adam states
+        torch.save(optimizer.state_dict(), oj(output_dir, "optimizer.pt"))
 
-    logger.info(f"Saved checkpoint at {output_dir}")
+        # Scheduler state is required to resume the learning rate schedule
+        torch.save(scheduler.state_dict(), oj(output_dir, "scheduler.pt"))
+
+        # ====== Save training state info ======
+
+        # This file stores metadata about training progress (e.g., step, best loss)
+        torch.save({
+            "step": cur_step,
+            "epoch": cur_epoch,
+            "best_loss": best_loss,
+        }, oj(output_dir, "trainer_state.pt"))
+
+        logger.info(f"Saved checkpoint at {output_dir}")
 
 
 def cal_kd_loss(query_embs, oracle_query_embs):
@@ -358,13 +366,50 @@ def train(args):
                         },
                         step=cur_step
                     )
-            #if dist.get_rank() == 0:
-            #    log_writer.add_scalar("train_{}_loss".format(args.loss_type), loss, cur_step)
-            cur_step += 1    # avoid saving the model of the first step.
+            cur_step += 1    
         # end for: each batch
 
-        # for each epoch, save model
-        if is_main_process and best_loss > loss:
+        # for each epoch, eval and save model
+        optimizer.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        if is_main_process:# and best_loss > loss:
+
+            beir_dataset_list = args.beir_datasets
+            query_encoder_for_eval = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
+            with torch.no_grad():
+                metric_numbers = eval_beir_datasets(
+                    beir_dataset_list,
+                    query_encoder_for_eval,
+                    query_tokenizer,
+                    args.beir_embedding_dir,
+                    args.beir_query_corpus_path,
+                    args.eval_batch_size,
+                    args.device,
+                    args.run_id,
+                    epoch
+                )
+            
+            if args.save_to_wandb:
+                for dataset_name, ndcg10 in metric_numbers.items():
+                    wandb.log(
+                        {
+                            f"eval/{dataset_name}_ndcg@10": ndcg10,
+                            f"eval/loss": loss,
+                        },
+                        step=epoch
+                    )
+                wandb.log(
+                    {
+                        f"eval/loss": loss,
+                    },
+                    step=epoch
+                )
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+                
             save_model(
                 args,
                 args.model_output_path,
@@ -376,13 +421,16 @@ def train(args):
                 epoch,
                 loss
             )
-            best_loss = loss
+            if best_loss > loss:
+                best_loss = loss
             if args.save_to_wandb:
-                wandb.run.summary["best_loss"] = loss
+                wandb.run.summary["best_loss"] = best_loss
                 
         # for each "epoch", wait for all processes to finish
         if args.n_gpu > 1:
             dist.barrier()
+        
+
 
     logger.info("Training finish!")          
     if is_main_process and args.save_to_wandb:   
@@ -414,6 +462,11 @@ def get_args():
     # yuchen: I will use this. 
     parser.add_argument("--warmup_ratio", type=float, default=0.06, help="Warm up ratio w.r.t total training steps.")
 
+    # eval settings
+    parser.add_argument("--beir_embedding_dir", type=str, default="/data/rech/huiyuche/beir/embeddings/ance", help="where to load the beir doc embeddings while validation.")
+    parser.add_argument("--eval_batch_size", type=int, default=32, help="eval batch size for beir eval.")
+    parser.add_argument("--beir_datasets", type=str, nargs='+', default=["scifact","trec-covid","nfcorpus","fiqa","arguana","webis-touche2020","quora","scidocs"], help="which beir datasets to eval on.")
+    parser.add_argument("--beir_query_corpus_path", type=str, default="/data/rech/huiyuche/beir", help="where the beir datasets are stored.")
 
     # complementary settings
 
@@ -468,12 +521,17 @@ if __name__ == '__main__':
     is_main_process = (args.n_gpu == 1) or (dist.get_rank() == 0)
 
     if is_main_process and args.save_to_wandb:
-        wandb.init(
+        run = wandb.init(
             project=args.wandb_project, 
             name=args.wandb_name,
             resume = "allow"
             )
         wandb.config.update(vars(args))
+
+    # create a run id based on time
+    # only useful for beir eval.
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    args.run_id = run_id
 
     set_seed(args)
     train(args)
