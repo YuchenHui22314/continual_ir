@@ -376,40 +376,42 @@ def train(args):
         
         if is_main_process:# and best_loss > loss:
 
-            beir_dataset_list = args.beir_datasets
-            query_encoder_for_eval = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
-            with torch.no_grad():
-                metric_numbers = eval_beir_datasets(
-                    beir_dataset_list,
-                    query_encoder_for_eval,
-                    query_tokenizer,
-                    args.beir_embedding_dir,
-                    args.beir_query_corpus_path,
-                    args.eval_batch_size,
-                    args.device,
-                    args.run_id,
-                    epoch
-                )
-            
-            if args.save_to_wandb:
-                for dataset_name, ndcg10 in metric_numbers.items():
+            if args.activate_eval_while_training:
+
+                beir_dataset_list = args.beir_datasets
+                query_encoder_for_eval = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
+                with torch.no_grad():
+                    metric_numbers = eval_beir_datasets(
+                        beir_dataset_list,
+                        query_encoder_for_eval,
+                        query_tokenizer,
+                        args.beir_embedding_dir,
+                        args.beir_query_corpus_path,
+                        args.eval_batch_size,
+                        args.device,
+                        args.run_id,
+                        epoch
+                    )
+                
+                if args.save_to_wandb:
+                    for dataset_name, ndcg10 in metric_numbers.items():
+                        wandb.log(
+                            {
+                                f"eval/{dataset_name}_ndcg@10": ndcg10,
+                                f"eval/loss": loss,
+                            },
+                            step=cur_step
+                        )
                     wandb.log(
                         {
-                            f"eval/{dataset_name}_ndcg@10": ndcg10,
                             f"eval/loss": loss,
                         },
-                        step=epoch
+                        step=cur_step
                     )
-                wandb.log(
-                    {
-                        f"eval/loss": loss,
-                    },
-                    step=epoch
-                )
-            
-            gc.collect()
-            torch.cuda.empty_cache()
                 
+                gc.collect()
+                torch.cuda.empty_cache()
+            # end if: eval while training 
             save_model(
                 args,
                 args.model_output_path,
@@ -425,7 +427,9 @@ def train(args):
                 best_loss = loss
             if args.save_to_wandb:
                 wandb.run.summary["best_loss"] = best_loss
-                
+
+        # end if: is main process 
+
         # for each "epoch", wait for all processes to finish
         if args.n_gpu > 1:
             dist.barrier()
@@ -463,6 +467,7 @@ def get_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.06, help="Warm up ratio w.r.t total training steps.")
 
     # eval settings
+    parser.add_argument("--activate_eval_while_training", action="store_true", help="if we will eval on beir datasets while training.")
     parser.add_argument("--beir_embedding_dir", type=str, default="/data/rech/huiyuche/beir/embeddings/ance", help="where to load the beir doc embeddings while validation.")
     parser.add_argument("--eval_batch_size", type=int, default=32, help="eval batch size for beir eval.")
     parser.add_argument("--beir_datasets", type=str, nargs='+', default=["scifact","trec-covid","nfcorpus","fiqa","arguana","webis-touche2020","quora","scidocs"], help="which beir datasets to eval on.")

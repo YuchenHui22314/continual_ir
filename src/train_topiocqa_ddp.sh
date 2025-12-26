@@ -62,6 +62,7 @@ torchrun \
   --save_to_wandb \
   --wandb_project "continual_ir" \
   --wandb_name "topiocqa_bs_120_beir" \
+  --activate_eval_while_training \
   --beir_embedding_dir "${BEIR_EMB_DIR}" \
   --eval_batch_size 64 \
   --beir_datasets climate-fever msmarco \
