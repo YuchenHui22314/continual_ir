@@ -84,13 +84,25 @@ def main(args):
 
     for line in tqdm(lines, desc=f"Rank {local_rank} encoding", total=len(lines)):
         record = json.loads(line)
-        sid = record["sample_id"]
+
+        if "sample_id" in record:
+            # topiocqa
+            sid = record["sample_id"]
+        else:
+            # msmarco
+            sid = record["query_id"]
 
         batch_texts.append(record["pos_docs"][0])
         batch_meta.append((sid, "pos"))
 
-        if "bm25_hard_neg_docs" in record and record["bm25_hard_neg_docs"]:
+        # topiocqa
+        if "bm25_hard_neg_docs" in record:
             batch_texts.append(record["bm25_hard_neg_docs"][0])
+            batch_meta.append((sid, "neg"))
+
+        # msmarco
+        if "bing_hard_neg_docs" in record and record["bing_hard_neg_docs"]:
+            batch_texts.append(record["bing_hard_neg_docs"][0])
             batch_meta.append((sid, "neg"))
 
         if "oracle_utt_text" in record:
@@ -146,10 +158,21 @@ if __name__ == "__main__":
     main(args)
 
 '''
+Topiocqa:
 torchrun --nproc_per_node=4 encode_pos_neg_docs_batched.py \
   --encoder_path /data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234 \
   --dataset_file /data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl \
   --output_embedding_file /data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/topiocqa_pos_neg_docs_ance/embeddings_multi_GPU.pt \
   --max_doc_length 512 \
   --encode_batch_size 512
+'''
+
+#Ms Marco
+'''
+torchrun --nproc_per_node=4 encode_pos_neg_docs_batched.py \
+  --encoder_path /data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234 \
+  --dataset_file /data/rech/huiyuche/TREC_iKAT_2024/data/topics/msmarco/msmarco_train.jsonl \
+  --output_embedding_file /data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/msmarco_pos_neg_docs_ance/embeddings_multi_GPU.pt \
+  --max_doc_length 512 \
+  --encode_batch_size 768 &>> /data/rech/huiyuche/TREC_iKAT_2024/logs/encode_ms_marco_pos_neg_docs_ance_log.txt
 '''

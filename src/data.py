@@ -117,35 +117,6 @@ class Topiocqa(Dataset):
             # HARD SAFETY CHECK (debug only, can remove later)
             assert len(flat_tokens) <= args.max_concat_length
 
-            # for j in range(len(ctx_utts_text) - 1, -1, -1):
-
-            #     # odd index : response, even index: query 
-            #     if j % 2 == 1:
-            #         max_length = args.max_response_length
-            #     else:
-            #         max_length = args.max_query_length
-
-            #     # with [cls] and [sep]
-            #     cls_context = self.tokenize( ctx_utts_text[j], max_len=max_length)
-            #     context = cls_context[1:]  # remove [CLS]
-
-            #     remaining = args.max_concat_length - total_length
-
-            #     if len(context) >= remaining:
-            #         if remaining > 2:
-            #             flat_concat.append(context[:remaining - 2] + [self.tokenizer.sep_token_id])
-            #         break
-            #     else:
-            #         flat_concat.append(context)
-            #         total_length += len(context)
-            
-            # # begin from the earliest turn
-            # flat_concat = flat_concat[::-1]  # reverse to make the order correct
-            # # [token..., SEP, token..., SEP, ..., token..., SEP]
-            # flat_concat = [token_id for turn in flat_concat for token_id in turn]
-            # # add [CLS] at the beginning
-            # flat_tokens = [self.tokenizer.cls_token_id]
-            # flat_tokens.extend(flat_concat)
 
             self.examples.append(
                 {
