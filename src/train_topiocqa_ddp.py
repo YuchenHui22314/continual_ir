@@ -285,17 +285,22 @@ def train(args):
                 pos_docs_mask = batch['pos_docs_mask'].to(args.device, non_blocking=True)
 
                 # yuchen: in DPR paper, it is shown that only one BM25 hard negative can be helpful, while two do not help further.
-                neg_docs = batch['neg_docs'].to(args.device, non_blocking=True)
-                neg_docs_mask = batch['neg_docs_mask'].to(args.device, non_blocking=True)
+                if args.negative_type != "none":
+                    neg_docs = batch['neg_docs'].to(args.device, non_blocking=True)
+                    neg_docs_mask = batch['neg_docs_mask'].to(args.device, non_blocking=True)
             
                 if "kd" in args.loss_type: 
                     oracle_query = batch['oracle_qr'].to(args.device, non_blocking=True)
                     oracle_query_mask = batch['oracle_qr_mask'].to(args.device, non_blocking=True)
+
                 passage_encoder.eval()
                 with torch.no_grad():
                 # doc encoder's parameters are frozen
                     pos_doc_embs = passage_encoder(pos_docs, pos_docs_mask).detach()  # B * dim
-                    neg_doc_embs = passage_encoder(neg_docs, neg_docs_mask).detach()  # (B * neg_ratio) * dim,      
+                    if args.negative_type != "none":
+                        neg_doc_embs = passage_encoder(neg_docs, neg_docs_mask).detach()  # B * dim
+                    else:
+                        neg_doc_embs = None
 
                     if "kd" in args.loss_type:
                         oracle_utt_embs = passage_encoder(oracle_query, oracle_query_mask).detach()
@@ -307,7 +312,7 @@ def train(args):
                     dim=0
                 ).to(args.device)   # [B, dim]
 
-                if sample_emb_table[sample_ids[0]]["neg"] is not None:
+                if sample_emb_table[sample_ids[0]]["neg"] is not None and args.negative_type != "none":
                     neg_doc_embs = torch.stack(
                         [sample_emb_table[sid]["neg"] for sid in sample_ids],
                         dim=0
@@ -324,6 +329,9 @@ def train(args):
             
             # end if: pre-encoded pos neg oracle embeddings
 
+
+            if args.negative_type == "none":
+                assert neg_doc_embs is None, "neg_doc_embs should be None when negative_type is 'none'."
 
             ranking_loss = cal_ranking_loss(complex_query_embs, pos_doc_embs, neg_doc_embs)
 
@@ -436,9 +444,16 @@ def train(args):
         
 
 
+
     logger.info("Training finish!")          
-    if is_main_process and args.save_to_wandb:   
+
+
+    if args.save_to_wandb:   
        wandb.finish()
+
+
+    dist.barrier()
+    dist.destroy_process_group()
        
 
 def get_args():
@@ -454,6 +469,8 @@ def get_args():
     parser.add_argument("--model_output_path", type=str, default="/data/rech/huiyuche/huggingface/continual_ir/topiocqa")
 
     parser.add_argument("--loss_type", type=str, default="ranking", help="The type of loss to use. Options: kd, kd+ranking, ranking")
+    parser.add_argument("--negative_type", type=str, default="bm25_hard", help="The type of loss to use. Options: bm25_hard,none")
+
     parser.add_argument("--num_train_epochs", type=int, default=20, help="num_train_epochs")
     parser.add_argument("--per_gpu_train_batch_size", type=int,  default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate")

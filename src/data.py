@@ -1,10 +1,10 @@
+import json
+import random
+
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
-import json
-from tqdm import tqdm, trange
-import csv
-import random
+from tqdm import tqdm
   
 class Topiocqa(Dataset):
 
@@ -227,6 +227,166 @@ class Topiocqa(Dataset):
 
                 "complex_query": conv_padded,
                 "complex_query_mask": conv_mask,
+
+                "pos_docs": pos_padded,
+                "pos_docs_mask": pos_mask,
+
+                "neg_docs": neg_padded,
+                "neg_docs_mask": neg_mask,
+
+                "oracle_qr": oracle_padded,
+                "oracle_qr_mask": oracle_mask,
+            }
+
+        return collate_fn
+
+
+
+class MSMARCODataset(Dataset):
+
+    def tokenize(self, text, max_len):
+        tokens = self.tokenizer.encode(
+            text,
+            add_special_tokens=True, # Automatically add [CLS] ... [SEP]
+            max_length=max_len,
+            truncation=True
+        )
+        return tokens
+
+    def __init__(self, args, tokenizer, filename):
+
+        self.examples = []
+        self.tokenizer = tokenizer
+        
+        with open(filename, encoding="utf-8") as f:
+            # Assuming jsonl format, read line by line
+            data = f.readlines()
+            
+        n = len(data)
+        n = int(args.use_data_percent * n)  
+        
+        # Randomly sample n samples for debugging or fractional usage
+        if n < len(data):
+            random.seed(args.seed)
+            data = random.sample(data, n)
+
+        for line in tqdm(data, desc="Loading MSMARCO dataset"):
+            record = json.loads(line)
+            
+            # 1. Query Processing
+            # MSMARCO does not have conversation history, so 'cur_utt_text' is just the query.
+            query_text = record['query']
+            
+            # Direct tokenization, includes [CLS] and [SEP]
+            # In Topiocqa this was 'conversation_tokens', here it is just 'query_tokens'
+            query_tokens = self.tokenize(query_text, max_len=args.max_query_length)
+
+            # 2. Positive Documents Processing
+            # According to the preprocessing script, pos_docs is a list. We take the first one.
+            pos_docs_list = record.get("pos_docs", [])
+            if len(pos_docs_list) > 0:
+                pos_doc_text = pos_docs_list[0]
+                pos_doc_tokens = self.tokenize(pos_doc_text, max_len=args.max_doc_length)
+            else:
+                # Handle edge case: no positive document (should not happen in training data)
+                pos_doc_tokens = []
+
+            # 3. Hard Negative Documents Processing
+            # Corresponds to 'bing_hard_neg_docs' from the preprocessing script
+            neg_docs_list = record.get("bing_hard_neg_docs", [])
+            if len(neg_docs_list) > 0:
+                # Strategy: take the first one. Alternatively: random.choice(neg_docs_list)
+                hard_neg_doc_text = neg_docs_list[0]
+                hard_neg_doc_tokens = self.tokenize(hard_neg_doc_text, max_len=args.max_doc_length)
+            else:
+                hard_neg_doc_tokens = []
+
+            # 4. Oracle Processing
+            # MSMARCO does not have oracle query rewrites, so we set this to empty.
+            # The collate_fn will handle this by padding with 0s.
+            oracle_utt_tokens = []
+
+            self.examples.append(
+                {
+                    'sample_id': record['query_id'],  # Maps to MSMARCO query_id
+                    'query_tokens': query_tokens,     # Renamed from 'conversation_tokens'
+                    "neg_doc_tokens": hard_neg_doc_tokens,
+                    "pos_doc_tokens": pos_doc_tokens,
+                    'oracle_tokens': oracle_utt_tokens,
+                }
+            )
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, item):
+        return self.examples[item]
+
+    @staticmethod
+    def get_collate_fn(args, pad_token_id=0):
+        
+        def pad_and_mask(seqs):
+            """
+            Pad a list of variable-length sequences to the maximum length
+            in the batch and build attention masks.
+            """
+            # Convert to tensors
+            tensors = [torch.tensor(s, dtype=torch.long) for s in seqs]
+
+            # Pad to batch-longest
+            padded = pad_sequence(
+                tensors,
+                batch_first=True,
+                padding_value=pad_token_id
+            )
+
+            # Attention mask
+            mask = (padded != pad_token_id).long()
+            return padded, mask
+
+        def collate_fn(batch):
+            sample_ids = []
+            query_seqs = []
+            pos_doc_seqs = []
+            neg_doc_seqs = []
+            oracle_seqs = []
+
+            # Unpack batch
+            for example in batch:
+                sample_ids.append(example["sample_id"])
+                query_seqs.append(example["query_tokens"]) # Changed key reference
+                pos_doc_seqs.append(example["pos_doc_tokens"])
+                neg_doc_seqs.append(example["neg_doc_tokens"])
+                oracle_seqs.append(example["oracle_tokens"])
+
+            # 1. Complex Query (Mapping query_seqs to complex_query for compatibility)
+            query_padded, query_mask = pad_and_mask(query_seqs)
+
+            # 2. Positive docs
+            pos_padded, pos_mask = pad_and_mask(pos_doc_seqs)
+
+            # 3. Negative docs (Handle potential empty lists)
+            if any(len(s) > 0 for s in neg_doc_seqs):
+                neg_padded, neg_mask = pad_and_mask(neg_doc_seqs)
+            else:
+                B = len(batch)
+                neg_padded = torch.zeros((B, 1), dtype=torch.long)
+                neg_mask = torch.zeros((B, 1), dtype=torch.long)
+
+            # 4. Oracle (Always empty for MSMARCO, handled here)
+            if any(len(s) > 0 for s in oracle_seqs):
+                oracle_padded, oracle_mask = pad_and_mask(oracle_seqs)
+            else:
+                B = len(batch)
+                oracle_padded = torch.zeros((B, 1), dtype=torch.long)
+                oracle_mask = torch.zeros((B, 1), dtype=torch.long)
+
+            # Return dictionary with keys matching Topiocqa for model compatibility
+            return {
+                "sample_ids": sample_ids,
+
+                "complex_query": query_padded,
+                "complex_query_mask": query_mask,
 
                 "pos_docs": pos_padded,
                 "pos_docs_mask": pos_mask,
