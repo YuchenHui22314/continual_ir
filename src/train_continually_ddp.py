@@ -251,7 +251,9 @@ def train(args):
 
     # 2. Prepare training data
     train_dataset = Topiocqa(args, query_tokenizer, args.training_data_file)
-    args.batch_size = (args.per_gpu_train_batch_size+ args.experience_replay_batch_size) * max(1, args.n_gpu)
+    # here, we do not have to consider experienc replay batch size....
+    # very confusing. Otherwise, warm up schedule will be wrong.
+    args.batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
 
     if args.n_gpu > 1:
         sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
