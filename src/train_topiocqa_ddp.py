@@ -172,7 +172,7 @@ def train(args):
         train_dataset, 
         batch_size=args.per_gpu_train_batch_size, 
         sampler=sampler, 
-        collate_fn=train_dataset.get_collate_fn(args, query_tokenizer.pad_token_id),
+        collate_fn=train_dataset.get_collate_fn(args, pad_token_id=query_tokenizer.pad_token_id),
         drop_last = True,
         pin_memory=True
         )

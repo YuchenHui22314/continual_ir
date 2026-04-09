@@ -181,6 +181,11 @@ src/evaluate/wandb/*
 /alignir_env
 *.txt
 *.pkl
+*.pt
+*.pb
+*.npy
+*.bin
+**/checkpoint-step-*/
 !requirements.txt
 **/test.py
 **/*.out

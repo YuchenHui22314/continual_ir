@@ -1,3 +1,4 @@
+import logging
 import json
 import random
 import torch
@@ -5,29 +6,29 @@ from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 def pad_and_mask(seqs, max_length, pad_token_id=0):
     """
-    Shared helper to pad a list of variable-length sequences to the maximum length
-    in the batch and build attention masks.
+    Pad all sequences to exactly max_length (not just batch max).
+    Always pads to max_length to guarantee consistent tensor dimensions
+    when merging batches from different datasets (e.g., TopiOCQA + MSMARCO
+    in Experience Replay, which may have different sequence lengths).
     """
-    # create a tenror of length max_length, add it to the seqs, do the pad, then remove this extra row
-    seqs.append([pad_token_id] * max_length)
-    # Convert to tensors
-
     tensors = [torch.tensor(s, dtype=torch.long) for s in seqs]
-
-    # Pad to batch-longest
-    padded = pad_sequence(
-        tensors,
-        batch_first=True,
-        padding_value=pad_token_id
-    )
-
-    padded = padded[:-1, :]  # remove the extra row
-
-    # Attention mask
+    padded = pad_sequence(tensors, batch_first=True, padding_value=pad_token_id)
+    # Ensure output is exactly max_length wide (crop or right-pad as needed)
+    B, L = padded.shape
+    if L < max_length:
+        extra = torch.full((B, max_length - L), pad_token_id, dtype=torch.long)
+        padded = torch.cat([padded, extra], dim=1)
+    elif L > max_length:
+        padded = padded[:, :max_length]
+    # Attention mask: 1 for real tokens, 0 for padding
     mask = (padded != pad_token_id).long()
     return padded, mask
+
 
 class BaseDataset(Dataset):
     """
@@ -54,7 +55,11 @@ class BaseDataset(Dataset):
         return self.examples[item]
 
     @staticmethod
-    def get_collate_fn(args, max_length, pad_token_id=0):
+    def get_collate_fn(args, pad_token_id=0):
+        # Always pad to args.max_concat_length (= 512) so tensors from different
+        # datasets (e.g., TopiOCQA + MSMARCO in Experience Replay) have identical
+        # dimensions and can be safely merged with torch.cat.
+        max_length = args.max_concat_length
         def collate_fn(batch):
             sample_ids = []
             complex_query_seqs = []  # Changed from conv_seqs
@@ -107,7 +112,75 @@ class BaseDataset(Dataset):
         return collate_fn
 
 
+
 class Topiocqa(BaseDataset):
+
+    def build_conv_query_tokens(
+        self,
+        tokenizer,
+        cur_utt_text,
+        ctx_utts_text,
+        max_query_length,
+        max_response_length,
+        max_concat_length,
+    ):
+        # We reserve 1 position for [CLS] at the beginning
+        max_context_len = max_concat_length - 1
+        flat_concat = []
+        total_len = 0
+
+        # build current utterance tokens
+        # goal of this code segement: build the conversation context as:
+        # [cls,q1,sep,r1,sep,q2,sep,r2,sep,...,qn,sep,rn,sep]
+
+        # ---- 1. Add current utterance first (most recent) ----
+        cur_utt_tokens = self.tokenize(cur_utt_text, max_len=max_query_length)
+        cur_tokens = cur_utt_tokens[1:] # remove [CLS], keep [SEP]
+
+        if len(cur_tokens) > max_context_len:
+            cur_tokens = cur_tokens[:max_context_len]
+            cur_tokens[-1] = tokenizer.sep_token_id
+
+        flat_concat.append(cur_tokens)
+        total_len += len(cur_tokens)
+
+        # ---- 2. Add historical utterances backward ----
+        for j in range(len(ctx_utts_text) - 1, -1, -1):
+            # odd index : response, even index : query
+            if j % 2 == 1: max_length = max_response_length
+            else: max_length = max_query_length
+
+            # tokenize with special tokens, then remove [CLS]
+            tokens = self.tokenize(ctx_utts_text[j], max_len=max_length)
+            tokens = tokens[1:] # remove [CLS], keep trailing [SEP]
+
+            remaining = max_context_len - total_len
+            if remaining <= 0: break
+
+            if len(tokens) <= remaining:
+                flat_concat.append(tokens)
+                total_len += len(tokens)
+            else:
+                # need to truncate tokens, but must end with [SEP]
+                truncated = tokens[:remaining]
+                truncated[-1] = tokenizer.sep_token_id
+                flat_concat.append(truncated)
+                total_len += len(truncated)
+                break
+
+        # ---- 3. Restore chronological order ----
+        flat_concat = flat_concat[::-1]
+
+        # ---- 4. Flatten and prepend [CLS] ----
+        flat_concat = [tok for turn in flat_concat for tok in turn]
+        flat_tokens = [tokenizer.cls_token_id]
+        flat_tokens.extend(flat_concat)
+
+        # HARD SAFETY CHECK (debug only, can remove later)
+
+        assert len(flat_tokens) <= max_concat_length
+        return flat_tokens
+
     def __init__(self, args, tokenizer, filename):
         super().__init__(args, tokenizer)
 
@@ -147,68 +220,104 @@ class Topiocqa(BaseDataset):
             else:
                 oracle_utt_tokens = []
             
-            # We reserve 1 position for [CLS] at the beginning
-            max_context_len = args.max_concat_length - 1
-            flat_concat = []
-            total_len = 0
+            flat_tokens = self.build_conv_query_tokens(
+                tokenizer,
+                cur_utt_text,
+                ctx_utts_text,
+                args.max_query_length,
+                args.max_response_length,
+                args.max_concat_length,
+            )
 
-            # build current utterance tokens
-            # goal of this code segement: build the conversation context as:
-            # [cls,q1,sep,r1,sep,q2,sep,r2,sep,...,qn,sep,rn,sep]
-
-            # ---- 1. Add current utterance first (most recent) ----
-            cur_utt_tokens = self.tokenize(cur_utt_text, max_len=args.max_query_length)
-            cur_tokens = cur_utt_tokens[1:] # remove [CLS], keep [SEP]
-
-            if len(cur_tokens) > max_context_len:
-                cur_tokens = cur_tokens[:max_context_len]
-                cur_tokens[-1] = tokenizer.sep_token_id
-
-            flat_concat.append(cur_tokens)
-            total_len += len(cur_tokens)
-
-            # ---- 2. Add historical utterances backward ----
-            for j in range(len(ctx_utts_text) - 1, -1, -1):
-                # odd index : response, even index : query
-                if j % 2 == 1: max_length = args.max_response_length
-                else: max_length = args.max_query_length
-
-                # tokenize with special tokens, then remove [CLS]
-                tokens = self.tokenize(ctx_utts_text[j], max_len=max_length)
-                tokens = tokens[1:] # remove [CLS], keep trailing [SEP]
-
-                remaining = max_context_len - total_len
-                if remaining <= 0: break
-
-                if len(tokens) <= remaining:
-                    flat_concat.append(tokens)
-                    total_len += len(tokens)
-                else:
-                    # need to truncate tokens, but must end with [SEP]
-                    truncated = tokens[:remaining]
-                    truncated[-1] = tokenizer.sep_token_id
-                    flat_concat.append(truncated)
-                    total_len += len(truncated)
-                    break
-
-            # ---- 3. Restore chronological order ----
-            flat_concat = flat_concat[::-1]
-
-            # ---- 4. Flatten and prepend [CLS] ----
-            flat_concat = [tok for turn in flat_concat for tok in turn]
-            flat_tokens = [tokenizer.cls_token_id]
-            flat_tokens.extend(flat_concat)
-
-            # HARD SAFETY CHECK (debug only, can remove later)
-            assert len(flat_tokens) <= args.max_concat_length
+            # turn_number: 1 = easiest (no history), increases with conversation depth.
+            # Used by curriculum learning to order examples by difficulty.
+            turn_number = 1 + len(ctx_utts_text) // 2
 
             self.examples.append({
-                'sample_id': record['sample_id'], 
+                'sample_id': record['sample_id'],
                 'query_tokens': flat_tokens, # Unified key
                 "neg_doc_tokens": bm25_hard_neg_doc,
                 "pos_doc_tokens": pos_doc_tokens,
                 'oracle_tokens': oracle_utt_tokens,
+                'turn_number': turn_number,
             })
+            
+            # # We reserve 1 position for [CLS] at the beginning
+            # max_context_len = args.max_concat_length - 1
+            # flat_concat = []
+            # total_len = 0
+
+            # # build current utterance tokens
+            # # goal of this code segement: build the conversation context as:
+            # # [cls,q1,sep,r1,sep,q2,sep,r2,sep,...,qn,sep,rn,sep]
+
+            # # ---- 1. Add current utterance first (most recent) ----
+            # cur_utt_tokens = self.tokenize(cur_utt_text, max_len=args.max_query_length)
+            # cur_tokens = cur_utt_tokens[1:] # remove [CLS], keep [SEP]
+
+            # if len(cur_tokens) > max_context_len:
+            #     cur_tokens = cur_tokens[:max_context_len]
+            #     cur_tokens[-1] = tokenizer.sep_token_id
+
+            # flat_concat.append(cur_tokens)
+            # total_len += len(cur_tokens)
+
+            # # ---- 2. Add historical utterances backward ----
+            # for j in range(len(ctx_utts_text) - 1, -1, -1):
+            #     # odd index : response, even index : query
+            #     if j % 2 == 1: max_length = args.max_response_length
+            #     else: max_length = args.max_query_length
+
+            #     # tokenize with special tokens, then remove [CLS]
+            #     tokens = self.tokenize(ctx_utts_text[j], max_len=max_length)
+            #     tokens = tokens[1:] # remove [CLS], keep trailing [SEP]
+
+            #     remaining = max_context_len - total_len
+            #     if remaining <= 0: break
+
+            #     if len(tokens) <= remaining:
+            #         flat_concat.append(tokens)
+            #         total_len += len(tokens)
+            #     else:
+            #         # need to truncate tokens, but must end with [SEP]
+            #         truncated = tokens[:remaining]
+            #         truncated[-1] = tokenizer.sep_token_id
+            #         flat_concat.append(truncated)
+            #         total_len += len(truncated)
+            #         break
+
+            # # ---- 3. Restore chronological order ----
+            # flat_concat = flat_concat[::-1]
+
+            # # ---- 4. Flatten and prepend [CLS] ----
+            # flat_concat = [tok for turn in flat_concat for tok in turn]
+            # flat_tokens = [tokenizer.cls_token_id]
+            # flat_tokens.extend(flat_concat)
+
+            # # HARD SAFETY CHECK (debug only, can remove later)
+            # assert len(flat_tokens) <= args.max_concat_length
+
+
+
+    def sort_by_difficulty(self, scoring_fn, ascending=True):
+        """
+        Sort self.examples in-place by the given scoring function.
+        Used by curriculum learning to establish easy-to-hard or hard-to-easy ordering.
+
+        Args:
+            scoring_fn: callable(example) -> numeric difficulty score
+            ascending:  True  → easy first (curriculum learning, easy2hard)
+                        False → hard first (anti-curriculum, hard2easy)
+        """
+        scores = [scoring_fn(ex) for ex in self.examples]
+        sorted_pairs = sorted(zip(scores, self.examples), key=lambda x: x[0], reverse=(not ascending))
+        self.examples = [ex for _, ex in sorted_pairs]
+        score_min = sorted_pairs[0][0]
+        score_max = sorted_pairs[-1][0]
+        logger.info(
+            f"Sorted {len(self.examples)} examples by difficulty "
+            f"(ascending={ascending}). Score range: [{score_min}, {score_max}]"
+        )
 
 
 class MSMARCODataset(BaseDataset):

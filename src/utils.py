@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 from pdb import run
+import faiss
 import pickle
 import json
 import random
@@ -19,7 +20,8 @@ logger = logging.getLogger(__name__)
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset, IterableDataset
-from transformers import AdamW
+# AdamW was removed from transformers in newer versions; use torch.optim directly
+AdamW = torch.optim.AdamW
 import torch.nn.functional as F
 from IPython import embed
 
@@ -122,14 +124,19 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def get_optimizer(args, model: nn.Module, weight_decay: float = 0.0, ) -> torch.optim.Optimizer:
+def get_optimizer(args, model: nn.Module, weight_decay: float = 0.0, fused: bool = False) -> torch.optim.Optimizer:
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
          'weight_decay': weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    if fused:
+        # fused AdamW: faster optimizer step on CUDA (PyTorch >= 2.0; A6000 supported)
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate,
+                                      eps=args.adam_epsilon, fused=True)
+    else:
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     return optimizer
 
 def optimizer_to(optim, device):
@@ -567,4 +574,394 @@ class BeirCustomDataLoader:
                 self.qrels[query_id][corpus_id] = score
 
 
-    
+#################
+### In-Memory FAISS Corpus Loading and Evaluation
+### Loads all corpus embeddings once at training startup; per-epoch eval only re-encodes queries.
+#################
+
+def load_corpus_into_faiss(embedding_dir: str, embed_dim: int = 768, use_gpu: bool = False):
+    """
+    Load all corpus embedding blocks from embedding_dir into a single FAISS flat-IP index.
+    Supports two file formats:
+      BEIR format:     corpus.{i}.pkl  →  tuple (float32 array, list of doc_ids)
+      TopiOCQA format: doc_emb_block.{i}.pb + doc_embid_block.{i}.pb
+
+    Args:
+        embedding_dir: directory containing the embedding block files
+        embed_dim:     embedding dimension (default: 768 for ANCE)
+        use_gpu:       if True, shard FAISS index across all available GPUs (requires faiss-gpu)
+
+    Returns:
+        (faiss_index, doc_ids):  flat-IP FAISS index + np.array of corresponding doc IDs
+    """
+    index = faiss.IndexFlatIP(embed_dim)
+    if use_gpu:
+        index = faiss.index_cpu_to_all_gpus(index)
+    all_ids = []
+
+    beir_0     = os.path.join(embedding_dir, "corpus.0.pkl")
+    topiocqa_0 = os.path.join(embedding_dir, "doc_emb_block.0.pb")
+
+    if os.path.exists(beir_0):
+        # BEIR format: each corpus.{i}.pkl is (embs_array, ids_list)
+        block_id = 0
+        while True:
+            fpath = os.path.join(embedding_dir, f"corpus.{block_id}.pkl")
+            if not os.path.exists(fpath):
+                break
+            with open(fpath, "rb") as f:
+                embs, ids = pickle.load(f)
+            index.add(np.array(embs, dtype=np.float32))
+            all_ids.extend(ids)
+            del embs
+            block_id += 1
+            if block_id % 20 == 0:
+                logger.info(f"  load_corpus_into_faiss: {block_id} BEIR blocks "
+                            f"({index.ntotal} docs) from {embedding_dir}")
+
+    elif os.path.exists(topiocqa_0):
+        # TopiOCQA format: separate emb and id files per block
+        block_id = 0
+        while True:
+            emb_path = os.path.join(embedding_dir, f"doc_emb_block.{block_id}.pb")
+            id_path  = os.path.join(embedding_dir, f"doc_embid_block.{block_id}.pb")
+            if not os.path.exists(emb_path):
+                break
+            with open(emb_path, "rb") as f:
+                embs = pickle.load(f)
+            with open(id_path, "rb") as f:
+                ids = pickle.load(f)
+            index.add(np.array(embs, dtype=np.float32))
+            all_ids.extend(ids.tolist() if hasattr(ids, "tolist") else list(ids))
+            del embs
+            block_id += 1
+            if block_id % 5 == 0:
+                logger.info(f"  load_corpus_into_faiss: {block_id} TopiOCQA blocks "
+                            f"({index.ntotal} docs) from {embedding_dir}")
+    else:
+        raise FileNotFoundError(
+            f"No recognized embedding blocks in {embedding_dir}. "
+            f"Expected corpus.0.pkl (BEIR) or doc_emb_block.0.pb (TopiOCQA)."
+        )
+
+    logger.info(f"load_corpus_into_faiss: {index.ntotal} total embeddings "
+                f"from {os.path.basename(embedding_dir)}")
+    return index, np.array(all_ids)
+
+
+def _build_topiocqa_query_tokens(
+    tokenizer,
+    cur_utt_text:        str,
+    ctx_utts_text:       list,
+    max_query_length:    int = 32,
+    max_response_length: int = 32,
+    max_concat_length:   int = 512,
+) -> list:
+    """
+    Standalone version of Topiocqa.build_conv_query_tokens from data.py.
+    Used in eval_topiocqa() to tokenize valid-set queries without instantiating the dataset class.
+    Format: [CLS] cur_q [SEP] ctx_n [SEP] ... ctx_1 [SEP]  (chronological, bounded by max_concat_length)
+    """
+    def _tok(text, max_len):
+        return tokenizer.encode(text, add_special_tokens=True, max_length=max_len, truncation=True)
+
+    max_context_len = max_concat_length - 1  # reserve 1 position for [CLS]
+    flat_concat = []
+    total_len   = 0
+
+    # Current utterance: tokenize, remove leading [CLS], keep trailing [SEP]
+    cur_tokens = _tok(cur_utt_text, max_len=max_query_length)[1:]
+    if len(cur_tokens) > max_context_len:
+        cur_tokens = cur_tokens[:max_context_len]
+        cur_tokens[-1] = tokenizer.sep_token_id
+    flat_concat.append(cur_tokens)
+    total_len += len(cur_tokens)
+
+    # Historical utterances: add backwards (most recent first), restore order later
+    for j in range(len(ctx_utts_text) - 1, -1, -1):
+        max_len = max_response_length if j % 2 == 1 else max_query_length
+        tokens  = _tok(ctx_utts_text[j], max_len=max_len)[1:]  # remove [CLS]
+        remaining = max_context_len - total_len
+        if remaining <= 0:
+            break
+        if len(tokens) <= remaining:
+            flat_concat.append(tokens)
+            total_len += len(tokens)
+        else:
+            truncated = tokens[:remaining]
+            truncated[-1] = tokenizer.sep_token_id
+            flat_concat.append(truncated)
+            break
+
+    # Restore chronological order, prepend [CLS]
+    flat_concat = flat_concat[::-1]
+    flat_tokens = [tokenizer.cls_token_id]
+    for seg in flat_concat:
+        flat_tokens.extend(seg)
+    return flat_tokens
+
+
+def eval_topiocqa(
+    query_encoder,
+    tokenizer,
+    test_data_file:      str,
+    qrel_file:           str,
+    faiss_index,
+    doc_ids:             np.ndarray,
+    device,
+    eval_batch_size:     int  = 64,
+    max_query_length:    int  = 32,
+    max_response_length: int  = 32,
+    max_concat_length:   int  = 512,
+    top_k:               int  = 100,
+    use_gpu_faiss:       bool = False,
+    keep_faiss_on_gpu:   bool = False,
+    gpu_index_cache:     dict = None,
+) -> dict:
+    """
+    Per-epoch TopiOCQA evaluation using a pre-loaded in-memory FAISS index.
+    Only re-encodes queries — no corpus disk I/O.
+
+    Args:
+        query_encoder:   current query encoder (temporarily set to eval mode; DDP-unwrapped)
+        tokenizer:       query tokenizer
+        test_data_file:  topiocqa_valid.jsonl  (fields: Conversation_no, Turn_no, Question, Context)
+        qrel_file:       TREC qrel (4 columns, no header): "qid 0 doc_id relevance"
+        faiss_index:     pre-loaded FAISS flat-IP CPU index for TopiOCQA corpus
+        doc_ids:         np.array of doc ID strings corresponding to FAISS index rows
+        device:          torch device for encoding
+        top_k:           number of docs to retrieve per query
+        use_gpu_faiss:   if True, transfer faiss_index to GPU (sharded) before searching
+        keep_faiss_on_gpu: if True AND use_gpu_faiss, cache the GPU index in gpu_index_cache
+                           so subsequent epochs reuse it without re-transfer (saves ~21s/epoch)
+        gpu_index_cache: mutable dict shared with caller — key "topiocqa" stores GPU index.
+                         Pass the same dict every epoch so the cache persists.
+
+    Returns:
+        dict: {"NDCG@10": float, f"Recall@{top_k}": float, "MRR@10": float}
+    """
+    encoder = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
+    encoder.eval()
+
+    # Load qrels — TREC 4-column format: qid  0  doc_id  rel  (no header)
+    qrels = {}
+    with open(qrel_file, encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 4:
+                continue
+            qid, doc_id, rel = parts[0], parts[2], int(parts[3])
+            qrels.setdefault(qid, {})[doc_id] = rel
+
+    # Load and tokenize valid queries (same conversation format as training)
+    query_ids, query_token_lists = [], []
+    with open(test_data_file, encoding="utf-8") as f:
+        for line in f:
+            record = json.loads(line.strip())
+            qid = f"{record['Conversation_no']}-{record['Turn_no']}"
+            if qid not in qrels:
+                continue  # skip queries without relevance judgements
+            tokens = _build_topiocqa_query_tokens(
+                tokenizer,
+                cur_utt_text        = record["Question"],
+                ctx_utts_text       = record["Context"],
+                max_query_length    = max_query_length,
+                max_response_length = max_response_length,
+                max_concat_length   = max_concat_length,
+            )
+            query_ids.append(qid)
+            query_token_lists.append(tokens)
+
+    # Encode queries in batches (pad within each batch to batch-max length)
+    pad_id   = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    all_embs = []
+    with torch.no_grad():
+        for i in range(0, len(query_token_lists), eval_batch_size):
+            seqs    = query_token_lists[i : i + eval_batch_size]
+            max_len = max(len(s) for s in seqs)
+            ids_tensor = torch.tensor(
+                [s + [pad_id] * (max_len - len(s)) for s in seqs], dtype=torch.long
+            ).to(device)
+            mask = (ids_tensor != pad_id).long()
+            embs = encoder(input_ids=ids_tensor, attention_mask=mask)
+            embs = F.normalize(embs, p=2, dim=-1)
+            all_embs.append(embs.float().cpu().numpy())  # float() handles BF16/FP16 models
+
+    query_embs = np.concatenate(all_embs, axis=0)  # (n_queries, 768)
+
+    # FAISS search — optionally move index to GPU for faster search
+    _cache_key = "topiocqa"
+    if use_gpu_faiss:
+        if keep_faiss_on_gpu and gpu_index_cache is not None and _cache_key in gpu_index_cache:
+            # Reuse cached GPU index from a previous epoch
+            idx_to_search = gpu_index_cache[_cache_key]
+            logger.info("eval_topiocqa: reusing cached GPU FAISS index.")
+        else:
+            # Transfer CPU index → sharded GPU index
+            logger.info("eval_topiocqa: transferring TopiOCQA index to GPU ...")
+            co = faiss.GpuMultipleClonerOptions()
+            co.shard = True
+            idx_to_search = faiss.index_cpu_to_all_gpus(faiss_index, co=co)
+            if keep_faiss_on_gpu and gpu_index_cache is not None:
+                gpu_index_cache[_cache_key] = idx_to_search
+                logger.info("eval_topiocqa: GPU index cached (keep_faiss_on_gpu=True).")
+        scores, indices = idx_to_search.search(query_embs.astype(np.float32), top_k)
+        if not keep_faiss_on_gpu:
+            del idx_to_search  # free GPU memory after search
+    else:
+        scores, indices = faiss_index.search(query_embs.astype(np.float32), top_k)
+
+    # Build run dict {qid: {doc_id: score}}
+    run = {}
+    for q_idx, qid in enumerate(query_ids):
+        run[qid] = {
+            str(doc_ids[int(idx)]): float(scores[q_idx, r])
+            for r, idx in enumerate(indices[q_idx])
+            if 0 <= int(idx) < len(doc_ids)
+        }
+
+    # Compute metrics via BEIR's evaluator (wraps pytrec_eval)
+    # MAP@10 == MRR@10 for TopiOCQA (exactly one relevant doc per query)
+    retriever = EvaluateRetrieval(None)
+    ndcg, _map, recall, _ = retriever.evaluate(qrels, run, [10, top_k])
+    metrics = {
+        "NDCG@10":           ndcg["NDCG@10"],
+        f"Recall@{top_k}":   recall[f"Recall@{top_k}"],
+        "MRR@10":            _map["MAP@10"],
+    }
+    logger.info(f"TopiOCQA eval: NDCG@10={metrics['NDCG@10']:.4f}  "
+                f"Recall@{top_k}={metrics[f'Recall@{top_k}']:.4f}  "
+                f"MRR@10={metrics['MRR@10']:.4f}")
+    encoder.train()
+    return metrics
+
+
+def build_beir_eval_cache(
+    dataset_list:        List[str],
+    embedding_base_path: str,
+    beir_data_path:      str,
+    embed_dim:           int  = 768,
+    use_gpu:             bool = False,
+) -> dict:
+    """
+    Load BEIR corpus embeddings into memory once at training startup.
+    Returns {dataset_name: (faiss_index, doc_ids, queries_dict, qrels_dict)}.
+    Pass the result to eval_beir_from_cache() each epoch.
+
+    Args:
+        dataset_list:        e.g. ["climate-fever", "msmarco"]
+        embedding_base_path: base dir, each dataset has a subdir with corpus.*.pkl files
+        beir_data_path:      base dir for BEIR text data (queries + qrels)
+        embed_dim:           embedding dimension (768 for ANCE)
+        use_gpu:             if True, shard FAISS indices across GPUs (requires faiss-gpu)
+    """
+    cache = {}
+    for dataset_name in dataset_list:
+        logger.info(f"build_beir_eval_cache: loading {dataset_name} corpus into FAISS ...")
+        embedding_dir = os.path.join(embedding_base_path, dataset_name)
+        faiss_idx, dids = load_corpus_into_faiss(embedding_dir, embed_dim=embed_dim, use_gpu=use_gpu)
+
+        split = "dev" if dataset_name == "msmarco" else "test"
+        _, queries, qrels = BeirCustomDataLoader(
+            os.path.join(beir_data_path, dataset_name, dataset_name)
+        ).load(split=split)
+
+        cache[dataset_name] = (faiss_idx, dids, queries, qrels)
+        logger.info(f"build_beir_eval_cache: {dataset_name} ready — "
+                    f"{faiss_idx.ntotal} docs, {len(queries)} queries.")
+    return cache
+
+
+def eval_beir_from_cache(
+    beir_cache:        dict,
+    query_encoder,
+    tokenizer,
+    device,
+    eval_batch_size:   int  = 64,
+    max_length:        int  = 64,
+    top_k:             int  = 1000,
+    use_gpu_faiss:     bool = False,
+    keep_faiss_on_gpu: bool = False,
+    gpu_index_cache:   dict = None,
+) -> dict:
+    """
+    Per-epoch BEIR evaluation using pre-loaded in-memory FAISS indices.
+    Only re-encodes queries (no corpus disk I/O).
+
+    Args:
+        beir_cache:        dict returned by build_beir_eval_cache()
+        query_encoder:     current query encoder (temporarily set to eval mode)
+        tokenizer:         query tokenizer
+        device:            torch device
+        eval_batch_size:   batch size for query encoding
+        max_length:        max token length for BEIR plain-text queries (default 64)
+        top_k:             number of docs to retrieve per query
+        use_gpu_faiss:     if True, transfer each corpus's CPU index to GPU before searching
+        keep_faiss_on_gpu: if True AND use_gpu_faiss, cache GPU indices in gpu_index_cache
+                           so subsequent epochs skip the transfer (~3-20s savings per dataset)
+        gpu_index_cache:   mutable dict shared with caller — key = dataset_name → gpu_faiss_index.
+                           Pass the same dict every epoch so the cache persists across calls.
+
+    Returns:
+        dict: {dataset_name: ndcg@10 score}
+    """
+    encoder = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
+    encoder.eval()
+    results = {}
+
+    for dataset_name, (faiss_idx, doc_ids, queries, qrels) in beir_cache.items():
+        query_ids   = list(queries.keys())
+        query_texts = [queries[qid] for qid in query_ids]
+
+        # Encode queries (plain text, not conversational)
+        all_embs = []
+        with torch.no_grad():
+            for i in range(0, len(query_texts), eval_batch_size):
+                batch   = query_texts[i : i + eval_batch_size]
+                encoded = tokenizer(batch, max_length=max_length, padding=True,
+                                    truncation=True, return_tensors="pt")
+                embs = encoder(input_ids=encoded["input_ids"].to(device),
+                               attention_mask=encoded["attention_mask"].to(device))
+                embs = F.normalize(embs, p=2, dim=-1)
+                all_embs.append(embs.float().cpu().numpy())  # float() handles BF16/FP16 models
+
+        query_embs = np.concatenate(all_embs, axis=0)
+
+        # FAISS search — optionally move index to GPU for faster search
+        if use_gpu_faiss:
+            if keep_faiss_on_gpu and gpu_index_cache is not None and dataset_name in gpu_index_cache:
+                # Reuse GPU index cached from a previous epoch
+                idx_to_search = gpu_index_cache[dataset_name]
+                logger.info(f"  eval_beir_from_cache {dataset_name}: reusing cached GPU index.")
+            else:
+                # Transfer CPU index → sharded GPU index
+                logger.info(f"  eval_beir_from_cache {dataset_name}: transferring index to GPU ...")
+                co = faiss.GpuMultipleClonerOptions()
+                co.shard = True
+                idx_to_search = faiss.index_cpu_to_all_gpus(faiss_idx, co=co)
+                if keep_faiss_on_gpu and gpu_index_cache is not None:
+                    gpu_index_cache[dataset_name] = idx_to_search
+                    logger.info(f"  eval_beir_from_cache {dataset_name}: GPU index cached.")
+            scores, indices = idx_to_search.search(query_embs.astype(np.float32), top_k)
+            if not keep_faiss_on_gpu:
+                del idx_to_search  # free GPU memory after search
+        else:
+            scores, indices = faiss_idx.search(query_embs.astype(np.float32), top_k)
+
+        # Build run dict {qid: {doc_id: score}}
+        run = {}
+        for q_idx, qid in enumerate(query_ids):
+            run[qid] = {
+                str(doc_ids[int(idx)]): float(scores[q_idx, r])
+                for r, idx in enumerate(indices[q_idx])
+                if 0 <= int(idx) < len(doc_ids)
+            }
+
+        # NDCG@10 via BEIR evaluator
+        retriever = EvaluateRetrieval(None)
+        ndcg, _, _, _ = retriever.evaluate(qrels, run, [10])
+        results[dataset_name] = ndcg["NDCG@10"]
+        logger.info(f"  eval_beir_from_cache {dataset_name}: NDCG@10 = {ndcg['NDCG@10']:.4f}")
+
+    encoder.train()
+    return results

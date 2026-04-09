@@ -9,18 +9,20 @@ def gen_topiocqa_qrel(raw_dev_file_path, output_qrel_file_path):
     raw_dev_file_path = "gold_dev.json"
     output_qrel_file_path = "topiocqa_qrel.trec"
     '''
+    lines = []
     with open(raw_dev_file_path, "r") as f:
-        data = json.load(f)
+        for line in f:
+            lines.append(json.loads(line))
     
     with open(output_qrel_file_path, "w") as f:
-        for line in tqdm(data):
+        for line in tqdm(lines):
             #sample_id = "{}_{}_{}".format("TopiOCQA-Dev", line["conv_id"], line["turn_id"])
-            sample_id = "{}-{}".format(line["conv_id"], line["turn_id"])
-            for pos in line["positive_ctxs"]:
-                #pid = int(pos["passage_id"]) - 1
-                pid = int(pos["passage_id"])
-                f.write("{} {} {} {}".format(sample_id, 0, pid, 1))
-                f.write('\n')
+            sample_id = "{}-{}".format(line["Conversation_no"], line["Turn_no"])
+            # for pos in line["positive_ctxs"]:
+            #pid = int(pos["passage_id"]) - 1
+            pid = line["Gold_passage"]["id"]
+            f.write("{} {} {} {}".format(sample_id, 0, pid, 1))
+            f.write('\n')
 
 
 def gen_train_test_files(raw_train_file_path, raw_dev_file_path, output_train_file_path, ouput_test_file_path, collection_file_path):
@@ -274,8 +276,8 @@ if __name__ == "__main__":
     output_train_file_path = "./train.json"
     output_test_file_path = "./test.json"
     collection_file_path = "./datasets/topiocqa/full_wiki_segments.tsv"
-    gen_train_test_files(raw_train_file_path, raw_dev_file_path, output_train_file_path, output_test_file_path, collection_file_path)
+    # gen_train_test_files(raw_train_file_path, raw_dev_file_path, output_train_file_path, output_test_file_path, collection_file_path)
 
-    raw_dev_file_path = "./gold_dev.json"
-    output_qrel_file_path = "./topiocqa_qrel.trec"
+    raw_dev_file_path = "/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_valid.jsonl"
+    output_qrel_file_path = "/data/rech/huiyuche/TREC_iKAT_2024/data/qrels/topiocqa_qrel.trec"
     gen_topiocqa_qrel(raw_dev_file_path, output_qrel_file_path)
