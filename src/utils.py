@@ -701,6 +701,48 @@ def _build_topiocqa_query_tokens(
     return flat_tokens
 
 
+def _compute_full_metrics(qrels: dict, run: dict) -> dict:
+    """
+    Compute the full set of retrieval metrics for a single dataset using pytrec_eval via BEIR.
+
+    Metrics computed:
+        map (MAP@10)
+        ndcg_cut.1/3/5/10
+        P.1/3/5/10
+        recall.5/50/100/1000
+        mrr@1/3/5/10
+
+    Args:
+        qrels: {qid: {doc_id: relevance}}
+        run:   {qid: {doc_id: score}}
+
+    Returns:
+        Flat dict of metric_name → float, e.g. {"NDCG@10": 0.42, "MRR@10": 0.38, ...}
+    """
+    retriever = EvaluateRetrieval(None)
+    k_values  = [1, 3, 5, 10, 50, 100, 1000]
+
+    ndcg, _map, recall, precision = retriever.evaluate(qrels, run, k_values)
+    mrr = retriever.evaluate_custom(qrels, run, [1, 3, 5, 10], metric="mrr")
+
+    metrics = {}
+    # MAP@10
+    metrics["MAP@10"] = _map.get("MAP@10", 0.0)
+    # NDCG@k
+    for k in [1, 3, 5, 10]:
+        metrics[f"NDCG@{k}"] = ndcg.get(f"NDCG@{k}", 0.0)
+    # Precision@k
+    for k in [1, 3, 5, 10]:
+        metrics[f"P@{k}"] = precision.get(f"P@{k}", 0.0)
+    # Recall@k
+    for k in [5, 50, 100, 1000]:
+        metrics[f"Recall@{k}"] = recall.get(f"Recall@{k}", 0.0)
+    # MRR@k
+    for k in [1, 3, 5, 10]:
+        metrics[f"MRR@{k}"] = mrr.get(f"MRR@{k}", 0.0)
+    return metrics
+
+
 def eval_topiocqa(
     query_encoder,
     tokenizer,
@@ -717,6 +759,7 @@ def eval_topiocqa(
     use_gpu_faiss:       bool = False,
     keep_faiss_on_gpu:   bool = False,
     gpu_index_cache:     dict = None,
+    full_eval:           bool = False,
 ) -> dict:
     """
     Per-epoch TopiOCQA evaluation using a pre-loaded in-memory FAISS index.
@@ -736,12 +779,21 @@ def eval_topiocqa(
                            so subsequent epochs reuse it without re-transfer (saves ~21s/epoch)
         gpu_index_cache: mutable dict shared with caller — key "topiocqa" stores GPU index.
                          Pass the same dict every epoch so the cache persists.
+        full_eval:       if True, compute the full metric suite (MAP, NDCG@1/3/5/10, P@1/3/5/10,
+                         Recall@5/50/100/1000, MRR@1/3/5/10) and return as flat dict.
+                         Also forces top_k=1000 to support Recall@1000.
+                         Use on the final epoch; log results to wandb summary.
 
     Returns:
-        dict: {"NDCG@10": float, f"Recall@{top_k}": float, "MRR@10": float}
+        If full_eval=False: dict {"NDCG@10": float, f"Recall@{top_k}": float, "MRR@10": float}
+        If full_eval=True:  flat dict with all metrics (see _compute_full_metrics).
     """
     encoder = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
     encoder.eval()
+
+    # full_eval requires Recall@1000 → force top_k=1000
+    if full_eval:
+        top_k = 1000
 
     # Load qrels — TREC 4-column format: qid  0  doc_id  rel  (no header)
     qrels = {}
@@ -820,18 +872,28 @@ def eval_topiocqa(
             if 0 <= int(idx) < len(doc_ids)
         }
 
-    # Compute metrics via BEIR's evaluator (wraps pytrec_eval)
-    # MAP@10 == MRR@10 for TopiOCQA (exactly one relevant doc per query)
-    retriever = EvaluateRetrieval(None)
-    ndcg, _map, recall, _ = retriever.evaluate(qrels, run, [10, top_k])
-    metrics = {
-        "NDCG@10":           ndcg["NDCG@10"],
-        f"Recall@{top_k}":   recall[f"Recall@{top_k}"],
-        "MRR@10":            _map["MAP@10"],
-    }
-    logger.info(f"TopiOCQA eval: NDCG@10={metrics['NDCG@10']:.4f}  "
-                f"Recall@{top_k}={metrics[f'Recall@{top_k}']:.4f}  "
-                f"MRR@10={metrics['MRR@10']:.4f}")
+    if full_eval:
+        # Full metric suite for final-epoch summary logging
+        metrics = _compute_full_metrics(qrels, run)
+        logger.info(
+            f"TopiOCQA full eval: NDCG@10={metrics['NDCG@10']:.4f}  "
+            f"Recall@100={metrics['Recall@100']:.4f}  "
+            f"MRR@10={metrics['MRR@10']:.4f}  "
+            f"MAP@10={metrics['MAP@10']:.4f}"
+        )
+    else:
+        # Lightweight per-epoch eval: NDCG@10, Recall@top_k, MRR@10
+        # MAP@10 == MRR@10 for TopiOCQA (exactly one relevant doc per query)
+        retriever = EvaluateRetrieval(None)
+        ndcg, _map, recall, _ = retriever.evaluate(qrels, run, [10, top_k])
+        metrics = {
+            "NDCG@10":           ndcg["NDCG@10"],
+            f"Recall@{top_k}":   recall[f"Recall@{top_k}"],
+            "MRR@10":            _map["MAP@10"],
+        }
+        logger.info(f"TopiOCQA eval: NDCG@10={metrics['NDCG@10']:.4f}  "
+                    f"Recall@{top_k}={metrics[f'Recall@{top_k}']:.4f}  "
+                    f"MRR@10={metrics['MRR@10']:.4f}")
     encoder.train()
     return metrics
 
@@ -883,6 +945,7 @@ def eval_beir_from_cache(
     use_gpu_faiss:     bool = False,
     keep_faiss_on_gpu: bool = False,
     gpu_index_cache:   dict = None,
+    full_eval:         bool = False,
 ) -> dict:
     """
     Per-epoch BEIR evaluation using pre-loaded in-memory FAISS indices.
@@ -901,12 +964,21 @@ def eval_beir_from_cache(
                            so subsequent epochs skip the transfer (~3-20s savings per dataset)
         gpu_index_cache:   mutable dict shared with caller — key = dataset_name → gpu_faiss_index.
                            Pass the same dict every epoch so the cache persists across calls.
+        full_eval:         if True, compute the full metric suite per dataset and return nested dict
+                           {dataset_name: {metric_name: value}}. Also forces top_k=1000.
+                           Use on the final epoch; log results to wandb summary.
 
     Returns:
-        dict: {dataset_name: ndcg@10 score}
+        If full_eval=False: {dataset_name: ndcg@10 score}
+        If full_eval=True:  {dataset_name: {metric_name: value}} (all metrics)
     """
     encoder = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
     encoder.eval()
+
+    # full_eval requires Recall@1000 → force top_k=1000
+    if full_eval:
+        top_k = 1000
+
     results = {}
 
     for dataset_name, (faiss_idx, doc_ids, queries, qrels) in beir_cache.items():
@@ -957,11 +1029,23 @@ def eval_beir_from_cache(
                 if 0 <= int(idx) < len(doc_ids)
             }
 
-        # NDCG@10 via BEIR evaluator
-        retriever = EvaluateRetrieval(None)
-        ndcg, _, _, _ = retriever.evaluate(qrels, run, [10])
-        results[dataset_name] = ndcg["NDCG@10"]
-        logger.info(f"  eval_beir_from_cache {dataset_name}: NDCG@10 = {ndcg['NDCG@10']:.4f}")
+        if full_eval:
+            # Full metric suite for final-epoch summary logging
+            dataset_metrics = _compute_full_metrics(qrels, run)
+            results[dataset_name] = dataset_metrics
+            logger.info(
+                f"  eval_beir_from_cache {dataset_name} full eval: "
+                f"NDCG@10={dataset_metrics['NDCG@10']:.4f}  "
+                f"Recall@100={dataset_metrics['Recall@100']:.4f}  "
+                f"MRR@10={dataset_metrics['MRR@10']:.4f}  "
+                f"MAP@10={dataset_metrics['MAP@10']:.4f}"
+            )
+        else:
+            # Lightweight per-epoch eval: NDCG@10 only
+            retriever = EvaluateRetrieval(None)
+            ndcg, _, _, _ = retriever.evaluate(qrels, run, [10])
+            results[dataset_name] = ndcg["NDCG@10"]
+            logger.info(f"  eval_beir_from_cache {dataset_name}: NDCG@10 = {ndcg['NDCG@10']:.4f}")
 
     encoder.train()
     return results

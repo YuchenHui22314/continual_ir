@@ -45,6 +45,53 @@ from data import Topiocqa
 from curriculum import SCORING_FUNCTIONS, PACING_FUNCTIONS, get_pacing_value, log_pacing_schedule
 
 
+def make_cycling_iter(loader, n_steps, epoch):
+    """
+    Yield exactly n_steps batches from loader, cycling through it as needed.
+
+    This ensures each curriculum epoch always performs the same number of optimizer
+    steps as the no-curriculum baseline (aligned total steps, as in DCL / Bengio).
+    When the active subset is smaller than the full dataset, the subset is traversed
+    multiple times within the epoch with a fresh shuffle each cycle.
+
+    DDP-safe: DistributedSampler.set_epoch() is called with a unique value per cycle
+    so each cycle gets a different random ordering.
+
+    Args:
+        loader:  DataLoader built from the active curriculum subset.
+        n_steps: Exact number of micro-batches to yield (= micro_steps_per_epoch
+                 computed from the full dataset, not the subset).
+        epoch:   Current training epoch (used to seed cycle shuffles).
+    """
+    yielded  = 0
+    cycle    = 0
+    while yielded < n_steps:
+        # Re-shuffle the subset sampler on each cycle to avoid repeating the same order.
+        if hasattr(loader.sampler, 'set_epoch'):
+            # Unique seed per (epoch, cycle) pair so no two cycles are identical.
+            loader.sampler.set_epoch(epoch * 10000 + cycle)
+        batches_this_cycle = 0
+        for batch in loader:
+            if yielded >= n_steps:
+                return
+            yield batch
+            yielded += 1
+            batches_this_cycle += 1
+        # Safety check: if the loader yielded nothing, the subset is too small for drop_last=True.
+        # Continuing would spin forever, so raise immediately with a clear message.
+        if batches_this_cycle == 0:
+            subset_size = len(loader.dataset) if hasattr(loader, 'dataset') else '?'
+            raise RuntimeError(
+                f"make_cycling_iter: DataLoader yielded 0 batches in cycle {cycle} "
+                f"(epoch={epoch}, subset_size={subset_size}, "
+                f"batch_size={loader.batch_size}, drop_last=True). "
+                f"The curriculum subset is too small to form even one batch. "
+                f"Increase --use_data_percent, reduce --per_gpu_train_batch_size, "
+                f"or increase --curriculum_c0 so the initial slice is large enough."
+            )
+        cycle += 1
+
+
 def save_model(args, model_output_path, model, query_tokenizer, optimizer, scheduler, cur_step, cur_epoch, best_loss):
     """
     Save a full training checkpoint including:
@@ -201,7 +248,8 @@ def train(args):
         scoring_fn = SCORING_FUNCTIONS[args.scoring_function]
         ascending   = (args.curriculum_type == "easy2hard")  # False → hard2easy
         train_dataset.sort_by_difficulty(scoring_fn, ascending=ascending)
-        logger.info(f"Curriculum type={args.curriculum_type}, "
+        direction_label = "easy→hard" if ascending else "hard→easy"
+        logger.info(f"Curriculum type={args.curriculum_type} ({direction_label}), "
                     f"scoring={args.scoring_function}, "
                     f"pacing={args.pacing_function}, "
                     f"c0={args.curriculum_c0}, "
@@ -210,10 +258,25 @@ def train(args):
     # ---- Step counts ----
     # steps_per_epoch counts *optimizer* steps (i.e., micro-batches / gradient_accumulation_steps).
     # Using full dataset length keeps LR schedule consistent regardless of curriculum subset.
-    micro_steps_per_epoch = len(train_dataset) // args.batch_size
+    #
+    # IMPORTANT: round micro_steps_per_epoch DOWN to the nearest complete accumulation window.
+    # This ensures the last micro-batch of every epoch always falls on an accumulation boundary,
+    # so the actual number of optimizer steps equals steps_per_epoch exactly — no leftover partial
+    # windows.  Without this, micro_steps_per_epoch % gradient_accumulation_steps != 0 would cause
+    # one extra optimizer/scheduler step per epoch (via the "last batch of epoch" is_last_in_accum
+    # condition), breaking total-step alignment and the LR schedule.
+    raw_micro_steps       = len(train_dataset) // args.batch_size
+    micro_steps_per_epoch = (raw_micro_steps // args.gradient_accumulation_steps) * args.gradient_accumulation_steps
     steps_per_epoch       = micro_steps_per_epoch // args.gradient_accumulation_steps
     total_training_steps  = args.num_train_epochs * steps_per_epoch
     curriculum_steps      = args.curriculum_end_epoch * steps_per_epoch
+
+    if steps_per_epoch == 0:
+        raise ValueError(
+            f"steps_per_epoch=0: dataset is too small or gradient_accumulation_steps is too large. "
+            f"raw_micro_steps={raw_micro_steps}, gradient_accumulation_steps={args.gradient_accumulation_steps}. "
+            f"Reduce --gradient_accumulation_steps or increase --use_data_percent."
+        )
 
     if is_main_process and args.curriculum_type != "none":
         log_pacing_schedule(
@@ -312,14 +375,41 @@ def train(args):
     args.log_print_steps = max(1, int(args.log_print_ratio * steps_per_epoch))
 
     # if we want to resume
+    # --resume_from_latest: find the highest-step checkpoint under model_output_path automatically
+    if args.resume_from_latest and args.resume_from_checkpoint is None:
+        ckpt_dirs = [
+            d for d in os.listdir(args.model_output_path)
+            if d.startswith("checkpoint-step-")
+               and os.path.isdir(os.path.join(args.model_output_path, d))
+               and os.path.exists(os.path.join(args.model_output_path, d, "trainer_state.pt"))
+        ] if os.path.isdir(args.model_output_path) else []
+
+        if ckpt_dirs:
+            # Sort by step number extracted from directory name
+            ckpt_dirs.sort(key=lambda d: int(d.split("checkpoint-step-")[-1]))
+            args.resume_from_checkpoint = os.path.join(args.model_output_path, ckpt_dirs[-1])
+            logger.info(f"--resume_from_latest: found {len(ckpt_dirs)} checkpoints, "
+                        f"resuming from {args.resume_from_checkpoint}")
+        else:
+            logger.info(f"--resume_from_latest: no checkpoints found in {args.model_output_path}, "
+                        f"starting from scratch.")
+
     if args.resume_from_checkpoint is not None:
         ckpt = args.resume_from_checkpoint
 
         # 1) Load model weights
+        # HuggingFace save_pretrained() saves as model.safetensors (not pytorch_model.bin).
+        # Use safetensors.torch.load_file to load correctly.
+        from safetensors.torch import load_file as safetensors_load_file
         model_to_load = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
-        model_to_load.load_state_dict(
-            torch.load(os.path.join(ckpt, "pytorch_model.bin"), map_location="cpu")
-        )
+        safetensors_path = os.path.join(ckpt, "model.safetensors")
+        pytorch_bin_path = os.path.join(ckpt, "pytorch_model.bin")
+        if os.path.exists(safetensors_path):
+            model_to_load.load_state_dict(safetensors_load_file(safetensors_path, device="cpu"))
+        elif os.path.exists(pytorch_bin_path):
+            model_to_load.load_state_dict(torch.load(pytorch_bin_path, map_location="cpu", weights_only=True))
+        else:
+            raise FileNotFoundError(f"No model weights found in {ckpt}. Expected model.safetensors or pytorch_model.bin.")
 
         # 2) Load optimizer and scheduler states
         optimizer.load_state_dict(torch.load(os.path.join(ckpt, "optimizer.pt"), map_location="cpu"))
@@ -361,20 +451,56 @@ def train(args):
                 c0               = args.curriculum_c0,
                 pacing_fn_name   = args.pacing_function,
             )
-            # Clamp: at least one full batch, at most the full dataset
-            n_active = max(args.batch_size, int(pacing_value * len(train_dataset)))
-            n_active = min(n_active, len(train_dataset))
-            subset   = Subset(train_dataset, range(n_active))
+
+            N = len(train_dataset)
+            if isinstance(pacing_value, tuple):
+                # step_exclusive: train on an exclusive slice [start, end)
+                start_frac, end_frac = pacing_value
+                start_idx     = int(start_frac * N)
+                intended_end  = min(int(end_frac * N), N)
+                # Safety: ensure at least one full global batch.
+                # Log a warning if we have to expand beyond the intended slice boundary.
+                end_idx = max(intended_end, start_idx + args.batch_size)
+                end_idx = min(end_idx, N)
+                if end_idx > intended_end and is_main_process:
+                    logger.warning(
+                        f"Epoch {epoch}: exclusive slice [{start_frac:.2f},{end_frac:.2f}) "
+                        f"has only {intended_end - start_idx} examples — smaller than "
+                        f"batch_size={args.batch_size}. Expanded to {end_idx - start_idx} "
+                        f"examples (may include examples outside the intended slice)."
+                    )
+                subset    = Subset(train_dataset, range(start_idx, end_idx))
+                n_active  = end_idx - start_idx
+                data_pct_lo = start_frac * 100.0
+                data_pct_hi = end_frac   * 100.0
+                pacing_log  = f"{data_pct_lo:.0f}%–{data_pct_hi:.0f}%"
+                wandb_pacing = end_frac - start_frac  # fraction of data in use
+            else:
+                # Cumulative pacing: train on first [0, pacing_value*N) examples
+                intended_n = int(pacing_value * N)
+                n_active   = max(args.batch_size, intended_n)
+                n_active   = min(n_active, N)
+                if n_active > intended_n and is_main_process:
+                    logger.warning(
+                        f"Epoch {epoch}: cumulative pacing fraction {pacing_value:.4f} gives "
+                        f"only {intended_n} examples — smaller than batch_size={args.batch_size}. "
+                        f"Expanded to {n_active} examples."
+                    )
+                subset   = Subset(train_dataset, range(n_active))
+                pacing_log  = f"0%–{pacing_value*100:.1f}%"
+                wandb_pacing = pacing_value
 
             if is_main_process:
-                logger.info(f"Epoch {epoch}: curriculum pacing_value={pacing_value:.4f}, "
-                            f"using {n_active}/{len(train_dataset)} examples "
-                            f"({100*pacing_value:.1f}%).")
+                direction_label = "easy→hard" if args.curriculum_type == "easy2hard" else "hard→easy"
+                logger.info(f"Epoch {epoch} [{direction_label}]: curriculum active data = {pacing_log} "
+                            f"({n_active}/{N} examples).")
                 if args.save_to_wandb:
                     wandb.log({
-                        "curriculum/pacing_value": pacing_value,
+                        "curriculum/pacing_value": wandb_pacing,
                         "curriculum/n_active":     n_active,
-                        "curriculum/data_pct":     pacing_value * 100.0,
+                        "curriculum/data_pct":     wandb_pacing * 100.0,
+                        # direction: +1 = easy→hard, -1 = hard→easy. Useful when comparing runs.
+                        "curriculum/direction":    1 if args.curriculum_type == "easy2hard" else -1,
                     }, step=cur_step)
 
             if args.n_gpu > 1:
@@ -394,9 +520,24 @@ def train(args):
             # Standard training: use the pre-built loader
             current_loader = train_loader
 
-        # yuchen: necessary to make the distribution of samples correct in DDP
-        if args.n_gpu > 1:
-            current_loader.sampler.set_epoch(epoch)
+        # ---- Build the micro-batch iterator for this epoch ----
+        #
+        # Curriculum epochs must always perform micro_steps_per_epoch micro-batches
+        # (same as the no-curriculum baseline) so that total optimizer steps are
+        # identical across all runs.  When the active subset is smaller than the full
+        # dataset, make_cycling_iter repeats it with fresh shuffles as needed.
+        #
+        # For standard training (no curriculum) we simply iterate the pre-built
+        # train_loader once — no cycling needed.
+        if args.curriculum_type != "none":
+            # DDP: first cycle's set_epoch is handled inside make_cycling_iter (cycle 0).
+            # We therefore skip the standalone set_epoch call below for curriculum.
+            batch_iter = make_cycling_iter(current_loader, micro_steps_per_epoch, epoch)
+        else:
+            # Standard: set epoch for DDP shuffling, then iterate normally.
+            if args.n_gpu > 1:
+                current_loader.sampler.set_epoch(epoch)
+            batch_iter = iter(current_loader)
 
         # BF16 autocast context for memory optimization (used if --use_bf16)
         autocast_ctx = (
@@ -406,9 +547,18 @@ def train(args):
         )
 
         optimizer.zero_grad()  # zero once before the loop; re-zero after each optimizer step
-        n_batches = len(current_loader)
 
-        for micro_step_in_epoch, batch in enumerate(tqdm(current_loader, desc="Step")):
+        # Total micro-batches this epoch = always micro_steps_per_epoch (full-dataset basis).
+        # This is the number that determines the last-batch-in-accum check.
+        n_batches = micro_steps_per_epoch
+
+        # cur_step tracks optimizer steps based on the FULL dataset size, not the curriculum subset.
+        # This keeps the wandb x-axis and LR schedule consistent across all pacing functions.
+        # We advance cur_step by steps_per_epoch at the start of each epoch and distribute
+        # the increment evenly across the micro-batches in this epoch.
+        epoch_step_start = epoch * steps_per_epoch  # first optimizer step of this epoch (full-data basis)
+
+        for micro_step_in_epoch, batch in enumerate(tqdm(batch_iter, total=micro_steps_per_epoch, desc="Step")):
 
             # Is this the last micro-batch in the current accumulation window?
             is_last_in_accum = (
@@ -519,6 +669,12 @@ def train(args):
                 kd_loss      = kd_loss.item()
                 grad_norm    = grad_norm.item()
 
+                # cur_step is epoch-based (full dataset) so x-axis is consistent across
+                # all pacing functions regardless of how many micro-batches were in this epoch.
+                # Map micro_step position within epoch → position within full-data steps_per_epoch.
+                optimizer_step_in_epoch = (micro_step_in_epoch + 1) // args.gradient_accumulation_steps
+                cur_step = epoch_step_start + min(optimizer_step_in_epoch, steps_per_epoch)
+
                 # print info
                 if is_main_process and cur_step % args.log_print_steps == 0:
                     logger.info("Epoch = {}, Current Step = {}, Total Step = {}, Loss = {}".format(
@@ -536,9 +692,12 @@ def train(args):
                             },
                             step=cur_step
                         )
-                cur_step += 1
 
         # end for: each batch
+
+        # Snap cur_step to the exact end of this epoch (full-data basis) so that
+        # eval/save logging always uses a consistent step regardless of subset size.
+        cur_step = (epoch + 1) * steps_per_epoch
 
         # Per-epoch cleanup (zero_grad now happens inside loop after each optimizer step,
         # but call again here to handle any leftover gradients from incomplete accum window)
@@ -547,6 +706,8 @@ def train(args):
         torch.cuda.empty_cache()
 
         if is_main_process:
+
+            is_last_epoch = (epoch == args.num_train_epochs - 1)
 
             # ---- BEIR eval (in-memory, fast) ----
             if args.activate_eval_while_training and beir_eval_cache is not None:
@@ -560,11 +721,18 @@ def train(args):
                         use_gpu_faiss      = args.use_gpu_faiss,
                         keep_faiss_on_gpu  = args.keep_faiss_on_gpu,
                         gpu_index_cache    = _gpu_faiss_cache,
+                        full_eval          = is_last_epoch,
                     )
 
                 if args.save_to_wandb:
-                    for dataset_name, ndcg10 in metric_numbers.items():
-                        wandb.log({f"eval/{dataset_name}_ndcg@10": ndcg10}, step=cur_step)
+                    if is_last_epoch:
+                        # Full metrics → wandb summary
+                        for dataset_name, dataset_metrics in metric_numbers.items():
+                            for metric_name, value in dataset_metrics.items():
+                                wandb.run.summary[f"final/{dataset_name}/{metric_name}"] = value
+                    else:
+                        for dataset_name, ndcg10 in metric_numbers.items():
+                            wandb.log({f"eval/{dataset_name}_ndcg@10": ndcg10}, step=cur_step)
                     wandb.log({"eval/loss": loss}, step=cur_step)
 
                 gc.collect()
@@ -588,13 +756,19 @@ def train(args):
                         use_gpu_faiss       = args.use_gpu_faiss,
                         keep_faiss_on_gpu   = args.keep_faiss_on_gpu,
                         gpu_index_cache     = _gpu_faiss_cache,
+                        full_eval           = is_last_epoch,
                     )
 
                 if args.save_to_wandb:
-                    wandb.log({
-                        f"eval/topiocqa_{k}": v
-                        for k, v in topiocqa_metrics.items()
-                    }, step=cur_step)
+                    if is_last_epoch:
+                        # Full metrics → wandb summary
+                        for metric_name, value in topiocqa_metrics.items():
+                            wandb.run.summary[f"final/topiocqa/{metric_name}"] = value
+                    else:
+                        wandb.log({
+                            f"eval/topiocqa_{k}": v
+                            for k, v in topiocqa_metrics.items()
+                        }, step=cur_step)
 
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -642,7 +816,11 @@ def get_args():
 
     parser.add_argument('--n_gpu', type=int, default=4, help='The number of used GPU.')
     parser.add_argument("--pretrained_encoder_path", type=str, default="/data/rech/huiyuche/huggingface/models--castorini--ance-msmarco-passage/snapshots/6d7e7d6b6c59dd691671f280bc74edb4297f8234")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint directory to resume training from")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to a specific checkpoint directory to resume from.")
+    parser.add_argument("--resume_from_latest", action="store_true",
+                        help="Automatically resume from the latest checkpoint under --model_output_path. "
+                             "Ignored if --resume_from_checkpoint is also set.")
     parser.add_argument("--training_data_file", type=str, default="/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl")
     parser.add_argument("--pos_neg_embedding_file", type=str, default=None)
     parser.add_argument("--model_output_path", type=str, default="/data/rech/huiyuche/huggingface/continual_ir/topiocqa_cl")
