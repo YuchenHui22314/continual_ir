@@ -760,6 +760,7 @@ def eval_topiocqa(
     keep_faiss_on_gpu:   bool = False,
     gpu_index_cache:     dict = None,
     full_eval:           bool = False,
+    left_padding:        bool = False,
 ) -> dict:
     """
     Per-epoch TopiOCQA evaluation using a pre-loaded in-memory FAISS index.
@@ -831,9 +832,12 @@ def eval_topiocqa(
         for i in range(0, len(query_token_lists), eval_batch_size):
             seqs    = query_token_lists[i : i + eval_batch_size]
             max_len = max(len(s) for s in seqs)
-            ids_tensor = torch.tensor(
-                [s + [pad_id] * (max_len - len(s)) for s in seqs], dtype=torch.long
-            ).to(device)
+            if left_padding:
+                # Left-pad: required for FlashAttention 2 (Qwen3). Last real token at position -1.
+                rows = [[pad_id] * (max_len - len(s)) + s for s in seqs]
+            else:
+                rows = [s + [pad_id] * (max_len - len(s)) for s in seqs]
+            ids_tensor = torch.tensor(rows, dtype=torch.long).to(device)
             mask = (ids_tensor != pad_id).long()
             embs = encoder(input_ids=ids_tensor, attention_mask=mask)
             embs = F.normalize(embs, p=2, dim=-1)

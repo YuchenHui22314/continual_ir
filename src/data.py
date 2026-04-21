@@ -9,22 +9,40 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def pad_and_mask(seqs, max_length, pad_token_id=0):
+def pad_and_mask(seqs, max_length, pad_token_id=0, dynamic=False, left_padding=False):
     """
-    Pad all sequences to exactly max_length (not just batch max).
-    Always pads to max_length to guarantee consistent tensor dimensions
-    when merging batches from different datasets (e.g., TopiOCQA + MSMARCO
-    in Experience Replay, which may have different sequence lengths).
+    Pad sequences and return (padded_tensor, attention_mask).
+
+    dynamic=False (default): pad to exactly max_length.
+        Used when batches from different datasets must be merged via torch.cat
+        (e.g., TopiOCQA + MSMARCO in Experience Replay).
+
+    dynamic=True: pad to batch-max length, hard-cap at max_length.
+        Saves memory when sequences are shorter than max_length on average
+        (e.g., Qwen3 training where mean query length ~170 << 512).
+
+    left_padding=True: pad on the left instead of the right.
+        Required for FlashAttention 2 (e.g., Qwen3-Embedding training).
+        Last real token is always at position -1, matching last-token pooling.
     """
-    tensors = [torch.tensor(s, dtype=torch.long) for s in seqs]
-    padded = pad_sequence(tensors, batch_first=True, padding_value=pad_token_id)
-    # Ensure output is exactly max_length wide (crop or right-pad as needed)
-    B, L = padded.shape
-    if L < max_length:
-        extra = torch.full((B, max_length - L), pad_token_id, dtype=torch.long)
-        padded = torch.cat([padded, extra], dim=1)
-    elif L > max_length:
-        padded = padded[:, :max_length]
+    # Determine target length
+    max_seq_len = max(len(s) for s in seqs)
+    if dynamic:
+        target_len = min(max_seq_len, max_length)
+    else:
+        target_len = max_length
+
+    B = len(seqs)
+    padded = torch.full((B, target_len), pad_token_id, dtype=torch.long)
+    for i, s in enumerate(seqs):
+        # Truncate if needed
+        tokens = s[:max_length] if len(s) > max_length else s
+        L = len(tokens)
+        if left_padding:
+            padded[i, target_len - L:] = torch.tensor(tokens, dtype=torch.long)
+        else:
+            padded[i, :L] = torch.tensor(tokens, dtype=torch.long)
+
     # Attention mask: 1 for real tokens, 0 for padding
     mask = (padded != pad_token_id).long()
     return padded, mask
@@ -55,10 +73,10 @@ class BaseDataset(Dataset):
         return self.examples[item]
 
     @staticmethod
-    def get_collate_fn(args, pad_token_id=0):
-        # Always pad to args.max_concat_length (= 512) so tensors from different
-        # datasets (e.g., TopiOCQA + MSMARCO in Experience Replay) have identical
-        # dimensions and can be safely merged with torch.cat.
+    def get_collate_fn(args, pad_token_id=0, dynamic_padding=False, left_padding=False):
+        # dynamic_padding=False: pad to args.max_concat_length (fixed 512) for cross-dataset compat.
+        # dynamic_padding=True:  pad to batch-max (hard-cap 512) to save memory when seqs are short.
+        # left_padding=True:     required for FlashAttention 2 (Qwen3-Embedding training).
         max_length = args.max_concat_length
         def collate_fn(batch):
             sample_ids = []
@@ -70,20 +88,22 @@ class BaseDataset(Dataset):
             # Unpack batch
             for example in batch:
                 sample_ids.append(example["sample_id"])
-                complex_query_seqs.append(example["query_tokens"]) 
+                complex_query_seqs.append(example["query_tokens"])
                 pos_doc_seqs.append(example["pos_doc_tokens"])
                 neg_doc_seqs.append(example["neg_doc_tokens"])
                 oracle_seqs.append(example["oracle_tokens"])
 
+            pad_kwargs = dict(pad_token_id=pad_token_id, dynamic=dynamic_padding, left_padding=left_padding)
+
             # 1. Complex Query (Conversation or Single Query)
-            conv_padded, conv_mask = pad_and_mask(complex_query_seqs, max_length, pad_token_id)
+            conv_padded, conv_mask = pad_and_mask(complex_query_seqs, max_length, **pad_kwargs)
 
             # 2. Positive Documents
-            pos_padded, pos_mask = pad_and_mask(pos_doc_seqs, max_length, pad_token_id)
+            pos_padded, pos_mask = pad_and_mask(pos_doc_seqs, max_length, **pad_kwargs)
 
             # 3. Negative Documents
             if any(len(s) > 0 for s in neg_doc_seqs):
-                neg_padded, neg_mask = pad_and_mask(neg_doc_seqs, max_length, pad_token_id)
+                neg_padded, neg_mask = pad_and_mask(neg_doc_seqs, max_length, **pad_kwargs)
             else:
                 B = len(batch)
                 neg_padded = torch.zeros((B, 1), dtype=torch.long)
@@ -91,7 +111,7 @@ class BaseDataset(Dataset):
 
             # 4. Oracle Utterances
             if any(len(s) > 0 for s in oracle_seqs):
-                oracle_padded, oracle_mask = pad_and_mask(oracle_seqs, max_length, pad_token_id)
+                oracle_padded, oracle_mask = pad_and_mask(oracle_seqs, max_length, **pad_kwargs)
             else:
                 B = len(batch)
                 oracle_padded = torch.zeros((B, 1), dtype=torch.long)
