@@ -1,0 +1,23 @@
+\begin{table}[t]
+    \centering
+    \caption{Qwen3-Embedding-0.6B results. *MS MARCO is excluded from the average BEIR score. Bold = best, underlined = worst.}
+    \resizebox{\columnwidth}{!}{
+    \begin{tabular}{@{}lccc}
+    \toprule
+        \multicolumn{1}{c}{\multirow{2}[2]{*}{Retriever ($\downarrow$)}} & \multicolumn{1}{c}{New Task} & \multicolumn{1}{c}{Previous Task} & \multicolumn{1}{c}{Out-of-Domain} \\
+        \cmidrule(lr){2-2} \cmidrule(lr){3-3} \cmidrule(lr){4-4}
+        & (TopiOCQA) & (MS MARCO) & (Avg. BEIR*)  \\
+        & NDCG@10 & NDCG@10 & NDCG@10 \\
+    \midrule
+        Qwen3 (w/o Conv. data)                   & \underline{13.83}         & \underline{26.37}         & \underline{46.51} \\
+        Conv-Qwen3 (w/o curriculum)              & 47.35                     & 30.92                     & \bf 50.00 \\
+        CL-step                                  & 47.16                     & 29.27                     & 48.41 \\
+        CL-step-excl                             & \bf 48.25                 & 30.27                     & 48.97 \\
+        CL-step-excl-full                        & 47.76                     & 29.97                     & 49.00 \\
+        ACL-root2                                & 46.72                     & \bf 31.63                 & 49.83 \\
+        ACL-step                                 & 46.29                     & 31.51                     & 49.70 \\
+        ACL-step-excl                            & 45.95                     & 30.53                     & 49.32 \\
+    \bottomrule
+     \end{tabular}}
+     \label{tab:qwen_results}
+\end{table}

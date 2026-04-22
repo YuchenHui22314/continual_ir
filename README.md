@@ -37,13 +37,27 @@ pip install flash-attn --no-build-isolation
 
 ---
 
+## Repository Layout
+
+```
+src/                 Training + model code (ANCE baselines, Qwen3 CL training, curriculum.py)
+index/               Distributed corpus indexing
+preprocess/data/     Data download, preprocessing, corpus merging, analysis
+preprocess/plots/    Figure-generation scripts (paper figures in figures/)
+preprocess/eval/     Offline BEIR/MSMARCO eval scripts for saved checkpoints
+scripts/             Batch experiment launchers (shell)
+figures/             Paper-ready figures, tables, and aggregated eval JSONs
+```
+
+---
+
 ## Data Preparation
 
 ### TopiOCQA
 
 ```bash
 # 1. Download the Wikipedia corpus (27 parquet shards, ~30 GB)
-cd preprocess/
+cd preprocess/data/
 bash download_topiocqa.sh
 
 # 2. Merge parquets to a single .tsv collection
@@ -64,7 +78,7 @@ python preprocess_topiocqa.py
 ### MSMARCO (for Experience Replay)
 
 ```bash
-cd preprocess/
+cd preprocess/data/
 bash download_msmarco_train.sh
 python preprocess_msmarco.py
 ```
@@ -99,7 +113,7 @@ Same command with `--model_type qwen3` and `--embed_dim 1024`. The encoder uses 
 Distributed indexing produces per-rank, per-block shards (`doc_emb_block.rank_R.B.pb`). Merge them into per-block files for use in training:
 
 ```bash
-python preprocess/merge_qwen_corpus.py \
+python preprocess/data/merge_qwen_corpus.py \
   --input_dir  <output_dir/topiocqa_qwen_unmerged> \
   --output_dir <output_dir/topiocqa_qwen_merged> \
   --embed_dim 1024 \
@@ -127,7 +141,7 @@ torchrun --nproc_per_node 4 src/encode_pos_neg_docs_batched.py \
 Positive/negative embeddings are extracted directly from the merged corpus index (no re-encoding needed):
 
 ```bash
-python preprocess/extract_qwen_pos_neg_from_corpus.py \
+python preprocess/data/extract_qwen_pos_neg_from_corpus.py \
   --train_file    <topiocqa_train_oracle.jsonl> \
   --corpus_dir    <topiocqa_qwen_merged/> \
   --encoder_path  <path_to_qwen3_embedding_0.6B> \

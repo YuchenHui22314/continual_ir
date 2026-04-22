@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # ---------- data ----------
-CSV = os.path.join(os.path.dirname(__file__), '..', 'figures', 'msmarco.csv')
+CSV = os.path.join(os.path.dirname(__file__), '..', '..', 'figures', 'msmarco.csv')
 df = pd.read_csv(CSV)
 steps = df['Step'].astype(float)
 STEPS_PER_EPOCH = 94.0
@@ -100,6 +100,6 @@ ax.tick_params(labelsize=12)
 sns.despine(offset=6)
 plt.tight_layout()
 
-out = os.path.join(os.path.dirname(__file__), '..', 'figures', 'training_curves_msmarco.png')
+out = os.path.join(os.path.dirname(__file__), '..', '..', 'figures', 'training_curves_msmarco.png')
 plt.savefig(out, dpi=200, bbox_inches='tight')
 print(f"Saved: {out}")

@@ -105,6 +105,6 @@ for ax in axes:
 
 plt.tight_layout()
 
-out_path = os.path.join(os.path.dirname(__file__), '..', 'figures', 'curriculum_pacing_all4.png')
+out_path = os.path.join(os.path.dirname(__file__), '..', '..', 'figures', 'curriculum_pacing_all4.png')
 plt.savefig(out_path, dpi=150, bbox_inches='tight')
 print(f"Saved: {out_path}")

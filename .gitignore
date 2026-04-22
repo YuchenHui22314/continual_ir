@@ -199,3 +199,7 @@ src/evaluate/wandb/*
 **/wandb/*
 #
 /data/topics/ikat23/fengran_10_qr_GRF_mistral.json
+
+# figures/ — keep paper-ready PNG/PDF/HTML/JSON/TeX, ignore one-off wandb exports and big caches
+/figures/*.csv
+/figures/*cache*.json

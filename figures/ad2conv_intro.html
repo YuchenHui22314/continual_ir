@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ad-hoc to Conversational Curriculum</title>
+<style>
+  :root {
+    --bg: #f5f0e8;
+    --panel: #faf6ef;
+    --ink: #2a2a28;
+    --muted: #6b6760;
+    --line: #d9d2c3;
+    --accent-warm: #c97a3a;
+    --accent-cool: #7a9a8f;
+    --encoder-1: #e8efe3;
+    --encoder-1-border: #b8c9a8;
+    --encoder-2: #a8b896;
+    --encoder-2-border: #7a8c66;
+    --encoder-3: #4a5a38;
+    --encoder-3-border: #3a4a28;
+    --data-box: #f2e4c4;
+    --data-box-border: #c9a75a;
+    --phase-1: #fbeec7;
+    --phase-2: #ead898;
+    --phase-3: #c9a75a;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-weight: 400;
+    line-height: 1.5;
+    padding: 48px 24px;
+    display: flex;
+    justify-content: center;
+  }
+
+  .container {
+    max-width: 1100px;
+    width: 100%;
+  }
+
+  h1 {
+    font-family: 'Tiempos Headline', 'Playfair Display', Georgia, serif;
+    font-size: 36px;
+    font-weight: 500;
+    letter-spacing: -0.5px;
+    margin-bottom: 8px;
+  }
+
+  .subtitle {
+    color: var(--muted);
+    font-size: 15px;
+    margin-bottom: 36px;
+  }
+
+  .diagram {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 36px 32px 28px 32px;
+  }
+
+  .stages-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 28px;
+    margin-bottom: 28px;
+  }
+
+  .stage {
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px 20px 22px 20px;
+    position: relative;
+  }
+
+  .stage-label {
+    font-family: 'Tiempos Headline', 'Playfair Display', Georgia, serif;
+    font-size: 17px;
+    font-weight: 500;
+    margin-bottom: 14px;
+    color: var(--ink);
+  }
+
+  .stage-label .bold {
+    font-weight: 600;
+  }
+
+  .stage-body {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-height: 180px;
+  }
+
+  .encoder-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    align-items: center;
+  }
+
+  .encoder {
+    width: 86px;
+    height: 58px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    font-size: 11.5px;
+    line-height: 1.2;
+    color: var(--ink);
+    clip-path: polygon(12% 0, 88% 0, 100% 100%, 0% 100%);
+    position: relative;
+  }
+
+  .encoder.light {
+    background: var(--encoder-1);
+    border: 1px solid var(--encoder-1-border);
+  }
+  .encoder.mid {
+    background: var(--encoder-2);
+    border: 1px solid var(--encoder-2-border);
+  }
+  .encoder.dark {
+    background: var(--encoder-3);
+    border: 1px solid var(--encoder-3-border);
+    color: #f3e6a8;
+  }
+  .encoder.dark .sub { color: #e0c97a; font-weight: 600; }
+
+  .badge {
+    position: absolute;
+    right: -8px;
+    bottom: -8px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: white;
+    border: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+  }
+
+  .data-box {
+    background: var(--data-box);
+    border: 1.5px dashed var(--data-box-border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    text-align: center;
+    font-size: 12.5px;
+    line-height: 1.5;
+    min-width: 120px;
+  }
+
+  .data-box .arrow {
+    color: var(--accent-warm);
+    margin: 2px 0;
+    font-size: 14px;
+  }
+
+  .data-tag {
+    display: inline-block;
+    margin-top: 10px;
+    padding: 3px 10px;
+    background: #f0e0d8;
+    border-radius: 20px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .turns-box {
+    background: var(--data-box);
+    border: 1.5px dashed var(--data-box-border);
+    border-radius: 10px;
+    padding: 10px;
+    font-size: 11px;
+    min-width: 110px;
+    text-align: center;
+  }
+
+  .turn {
+    background: #d8c48a;
+    border: 1px solid #b89a5a;
+    border-radius: 4px;
+    padding: 3px 6px;
+    margin: 3px 0;
+    font-size: 10.5px;
+  }
+
+  .turn.last {
+    background: #e8d8a8;
+  }
+
+  .arrow-flow {
+    flex-grow: 1;
+    height: 2px;
+    background: linear-gradient(to right, var(--accent-warm), var(--accent-warm));
+    position: relative;
+    margin: 0 4px;
+  }
+
+  .arrow-flow::after {
+    content: '';
+    position: absolute;
+    right: -1px;
+    top: -4px;
+    border-left: 8px solid var(--accent-warm);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+  }
+
+  .curriculum-section {
+    margin-top: 8px;
+  }
+
+  .curriculum-title {
+    font-family: 'Tiempos Headline', 'Playfair Display', Georgia, serif;
+    font-size: 16px;
+    font-weight: 500;
+    margin-bottom: 12px;
+    color: var(--ink);
+    text-align: center;
+  }
+
+  .curriculum-title .bold { font-weight: 600; }
+
+  .phases {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+  }
+
+  .phase {
+    padding: 14px 16px;
+    font-size: 12.5px;
+    text-align: center;
+    color: var(--ink);
+  }
+
+  .phase .label {
+    font-weight: 600;
+    margin-bottom: 2px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .phase.p1 { background: var(--phase-1); }
+  .phase.p2 { background: var(--phase-2); }
+  .phase.p3 { background: var(--phase-3); color: #3a2a08; }
+
+  .legend {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    margin-top: 20px;
+    font-size: 11.5px;
+    color: var(--muted);
+    flex-wrap: wrap;
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+
+  .mini-encoder {
+    width: 20px; height: 12px;
+    clip-path: polygon(15% 0, 85% 0, 100% 100%, 0% 100%);
+  }
+  .mini-encoder.light { background: var(--encoder-1); border: 1px solid var(--encoder-1-border); }
+  .mini-encoder.mid { background: var(--encoder-2); border: 1px solid var(--encoder-2-border); }
+  .mini-encoder.dark { background: var(--encoder-3); border: 1px solid var(--encoder-3-border); }
+
+</style>
+</head>
+<body>
+  <div class="container">
+    <h1>Ad-hoc to Conversational Curriculum</h1>
+    <p class="subtitle">A two-stage curriculum that bridges ad-hoc retrieval and conversational search.</p>
+
+    <div class="diagram">
+      <div class="stages-row">
+
+        <!-- Stage 1 -->
+        <div class="stage">
+          <div class="stage-label">Stage 1 · <span class="bold">Ad-hoc training</span></div>
+          <div class="stage-body">
+            <div class="encoder-stack">
+              <div class="encoder light">
+                LLM<br>Encoder
+                <div class="badge">🔥</div>
+              </div>
+              <div class="encoder light">
+                LLM<br>Encoder
+                <div class="badge">🔥</div>
+              </div>
+            </div>
+            <div class="arrow-flow"></div>
+            <div class="data-box">
+              Ad-hoc Query
+              <div class="arrow">↕</div>
+              Positive Docs
+              <div class="data-tag">Ad-hoc data</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stage 2 -->
+        <div class="stage">
+          <div class="stage-label">Stage 2 · <span class="bold">Conversational training</span></div>
+          <div class="stage-body">
+            <div class="encoder-stack">
+              <div class="encoder mid">
+                Ad-hoc doc<br>Encoder
+                <div class="badge">❄️</div>
+              </div>
+              <div class="encoder mid">
+                Ad-hoc query<br>Encoder
+                <div class="badge">🔥</div>
+              </div>
+            </div>
+            <div class="arrow-flow"></div>
+            <div class="turns-box">
+              <div class="turn">Turn 1: [q₁ a₁]</div>
+              <div class="turn">Turn 2: [q₂ a₂]</div>
+              <div style="font-size:12px; color:var(--muted);">⋮</div>
+              <div class="turn last">Turn n: qₙ</div>
+              <div style="color:var(--accent-warm); margin:4px 0;">↕</div>
+              <div style="font-size:11.5px;">Positive Docs</div>
+              <div class="data-tag">Conv data</div>
+            </div>
+            <div class="arrow-flow"></div>
+            <div class="encoder-stack">
+              <div class="encoder mid">
+                <span><b>Ad-hoc</b> doc<br>Encoder</span>
+              </div>
+              <div class="encoder dark">
+                <span class="sub">Conv query<br>Encoder</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Curriculum -->
+      <div class="curriculum-section">
+        <div class="curriculum-title">
+          Apply an <span class="bold">Ad-hoc-to-conv</span> curriculum at <span class="bold">Stage 2</span>
+        </div>
+        <div class="phases">
+          <div class="phase p1">
+            <div class="label">Phase 1</div>
+            single / few-turn dialogue
+          </div>
+          <div class="phase p2">
+            <div class="label">Phase 2</div>
+            medium-length dialogue
+          </div>
+          <div class="phase p3">
+            <div class="label">Phase 3</div>
+            complex deep dialogue
+          </div>
+        </div>
+      </div>
+
+      <div class="legend">
+        <div class="legend-item"><div class="mini-encoder light"></div> LLM encoder (pre-stage 1)</div>
+        <div class="legend-item"><div class="mini-encoder mid"></div> Ad-hoc encoder (post-stage 1)</div>
+        <div class="legend-item"><div class="mini-encoder dark"></div> Conv query encoder (post-stage 2)</div>
+        <div class="legend-item">🔥 trainable · ❄️ frozen</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

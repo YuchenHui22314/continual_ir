@@ -1,0 +1,20 @@
+{
+  "topiocqa_anticl_root_2": {
+    "label": "ACL-root$_2$",
+    "topo_ndcg": 0.1994,
+    "ms_ndcg": 0.30274,
+    "beir_avg": 0.34010153846153846
+  },
+  "topiocqa_anticl_step": {
+    "label": "ACL-step",
+    "topo_ndcg": 0.19738,
+    "ms_ndcg": 0.30272,
+    "beir_avg": 0.33930923076923075
+  },
+  "topiocqa_anticl_step_exclusive": {
+    "label": "ACL-step-excl",
+    "topo_ndcg": 0.19328,
+    "ms_ndcg": 0.30525,
+    "beir_avg": 0.3436338461538462
+  }
+}

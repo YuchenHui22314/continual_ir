@@ -1,0 +1,41 @@
+\begin{table*}[t]
+    \centering
+    \caption{Curriculum-learning results on two dense retrievers of different scale: ANCE (RoBERTa-base, 768\,d) and Qwen3-Embedding-0.6B (1024\,d). All scores are NDCG@10 ($\times 100$). We report three complementary axes: the new conversational task (TopiOCQA), the previous ad-hoc task used for pre-training (MS~MARCO), and out-of-domain generalisation (Avg. BEIR\textsuperscript{$\star$}, i.e.\ the mean NDCG@10 over the 13 BEIR benchmarks excluding MS~MARCO). \emph{w/o Conv.\ data} denotes the zero-shot base encoder (no conversational fine-tuning); \emph{w/o curriculum} denotes Conv-ANCE / Conv-Qwen3 fine-tuned on TopiOCQA with random sample ordering. CL / ACL prefixes denote easy-to-hard and hard-to-easy pacings respectively, paired with pacing functions $\{\text{root}_2, \text{step}, \text{step-excl}, \text{step-excl-full}\}$. \textbf{Bold} and \underline{underlined} entries mark the best and worst score \emph{within each encoder and each metric column}.}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{@{}l ccc ccc@{}}
+    \toprule
+        \multirow{3}[2]{*}{Retriever ($\downarrow$)} &
+        \multicolumn{3}{c}{\textbf{ANCE}} &
+        \multicolumn{3}{c}{\textbf{Qwen3-Embedding-0.6B}} \\
+        \cmidrule(lr){2-4} \cmidrule(lr){5-7}
+         & New Task  & Previous Task & Out-of-Domain
+         & New Task  & Previous Task & Out-of-Domain \\
+         & (TopiOCQA) & (MS MARCO)   & (Avg.\ BEIR*)
+         & (TopiOCQA) & (MS MARCO)   & (Avg.\ BEIR*) \\
+    \midrule
+        w/o Conv.\ data
+         & \underline{10.60} & \textbf{34.02} & \textbf{39.66}
+         & \underline{13.83} & \underline{26.37} & \underline{46.51} \\
+        w/o curriculum
+         & 19.63 & 30.28 & 33.62
+         & 47.35 & 30.92 & \textbf{50.00} \\
+    \midrule
+        CL-step               & 19.65 & 29.90 & 33.25
+                              & 47.16 & 29.27 & 48.41 \\
+        CL-step-excl          & 19.90 & \underline{29.69} & \underline{33.09}
+                              & \textbf{48.25} & 30.27 & 48.97 \\
+        CL-step-excl-full     & \textbf{20.27} & 29.72 & \underline{33.09}
+                              & 47.76 & 29.97 & 49.00 \\
+        CL-root$_2$           & 19.71 & 29.79 & 33.27
+                              & 46.84 & 29.96 & 49.03 \\
+    \midrule
+        ACL-root$_2$          & 19.94 & 30.27 & 34.01
+                              & 46.72 & \textbf{31.63} & 49.83 \\
+        ACL-step              & 19.74 & 30.27 & 33.93
+                              & 46.29 & 31.51 & 49.70 \\
+        ACL-step-excl         & 19.33 & 30.53 & 34.36
+                              & 45.95 & 30.53 & 49.32 \\
+    \bottomrule
+    \end{tabular}}
+    \label{tab:main_results}
+\end{table*}

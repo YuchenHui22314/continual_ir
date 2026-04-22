@@ -2,13 +2,16 @@
 
 ## Project Overview
 
-Continual learning for Information Retrieval. Fine-tune an ANCE (RoBERTa-base) query encoder
-on conversational search datasets (TopiOCQA, MSMARCO) using Experience Replay.
+Continual learning for Information Retrieval. Fine-tune a dense query encoder — either
+ANCE (RoBERTa-base, 768d) or Qwen3-Embedding-0.6B (LLM-based, 1024d) — on conversational
+search data (TopiOCQA) while retaining performance on the previous ad-hoc task (MSMARCO)
+and OOD generalisation (BEIR).
 
-Currently implementing: **Curriculum Learning** on TopiOCQA fine-tuning.
-- Scoring: conversation turn length (# turns, lower = easier)
-- Pacing: root_2 pacing function (from DCL 2208 / transformers_cl 1912, same formula)
-- Baselines: random (original), easy2hard (curriculum), hard2easy (anti-curriculum)
+Current focus: **Curriculum Learning** on Stage-2 TopiOCQA fine-tuning.
+- Scoring: conversation turn length (`turn = 1 + |ctx|//2`, lower = easier).
+- Pacing: `root_2`, `step`, `step_exclusive`, `step_exclusive_2_full` (see `src/curriculum.py`).
+- Ordering: `easy2hard` (curriculum, CL) or `hard2easy` (anti-curriculum, ACL) or `none` (random baseline).
+- Experience Replay from Stage 1 is supported on the ANCE branch (`train_continually_ddp.py`).
 
 ## Key File Paths
 
@@ -18,10 +21,20 @@ Currently implementing: **Curriculum Learning** on TopiOCQA fine-tuning.
 | `src/models.py` | ANCE model (RobertaForSequenceClassification-based) |
 | `src/train_topiocqa_ddp.py` | **Baseline** TopiOCQA-only training — DO NOT MODIFY |
 | `src/train_continually_ddp.py` | Continual training w/ ER — DO NOT MODIFY |
-| `src/train_continually_ddp_cl.py` | NEW: Curriculum learning training script |
-| `src/curriculum.py` | NEW: Scoring functions + pacing functions |
+| `src/train_continually_ddp_cl.py` | ANCE curriculum learning training script |
+| `src/train_qwen_cl.py` | Qwen3-Embedding-0.6B curriculum learning training script (bf16, FlashAttention-2) |
+| `src/curriculum.py` | Scoring functions + pacing functions (`root_2`, `step`, `step_exclusive`, `step_exclusive_2_full`) |
 | `src/utils.py` | BEIR eval, optimizer, in-memory FAISS eval functions |
-| `preprocess/analyze_topiocqa_turns.py` | Turn-length statistics script |
+| `preprocess/data/analyze_topiocqa_turns.py` | Turn-length statistics script |
+| `preprocess/data/extract_qwen_pos_neg_from_corpus.py` | Build Qwen pos/neg embedding cache directly from corpus index |
+| `preprocess/plots/plot_pacing_all4.py` | Paper Fig.2 — all 4 pacing functions |
+| `preprocess/plots/plot_turn_distribution.py` | Paper Fig.3 — TopiOCQA turn histogram |
+| `preprocess/plots/plot_{ance,qwen}_curves.py` | Paper Fig.4 — per-encoder per-epoch NDCG@10 curves |
+| `preprocess/plots/plot_curves_static_styles.py` | Combined Nature/IEEE/seaborn/ggplot styles for paper figure |
+| `preprocess/eval/eval_{ance,qwen}_beir_full.py` | Offline BEIR + MSMARCO eval over saved checkpoints |
+| `preprocess/eval/eval_qwen_base_full.py` | Qwen3 zero-shot (no Stage 2) BEIR + MSMARCO eval |
+| `scripts/run_qwen_8_experiments.sh` | Batch launcher for the 8 Qwen3 curriculum runs |
+| `figures/` | Paper-ready figures, tables, aggregated eval JSONs |
 
 ## Key Data Paths
 
@@ -53,11 +66,15 @@ train_topiocqa_ddp.py
 ## Curriculum Learning Details
 
 - **Difficulty score**: `turn_number = 1 + len(ctx_utts_text) // 2` (1 = easiest)
-- **Pacing function**: `root_2(x, t, c0) = ((x*(1-c0^2)/t) + c0^2)^0.5`
-  - `x` = epoch_start_step, `t` = curriculum_steps (epoch 16 × steps_per_epoch)
-  - `c0` (delta_p) = initial fraction; tune based on `analyze_topiocqa_turns.py` output
-- **Curriculum type**: `easy2hard` (ascending) or `hard2easy` (descending)
-- **DataLoader**: recreated each epoch with Subset of first `n_active` sorted examples
+- **Pacing functions** (in `src/curriculum.py`):
+  - `root_2(x, t, c0) = ((x*(1-c0²)/t) + c0²)^0.5` — smooth cumulative
+  - `step(x, t, c0)` — 3-stage cumulative: c0 → (c0+1)/2 → 1.0 at T/3 and 2T/3
+  - `step_exclusive(x, t, c0)` — 3-stage exclusive slicing: [0,c0), [c0,(c0+1)/2), [(c0+1)/2,1)
+  - `step_exclusive_2_full` — like `step_exclusive` during curriculum, reverts to [0,1) after `curriculum_end_epoch`
+  - `x` = epoch_start_step, `t` = curriculum_steps (epoch 16 × steps_per_epoch by default)
+  - `c0` (delta_p) = initial fraction; default 0.2 (motivated by turn histogram)
+- **Curriculum type**: `easy2hard` (CL), `hard2easy` (ACL), or `none` (random baseline)
+- **DataLoader**: recreated each epoch with Subset of examples indexed by the pacing function
 
 ## Data Analysis Log
 

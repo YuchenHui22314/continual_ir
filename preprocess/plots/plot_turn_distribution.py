@@ -110,6 +110,6 @@ for label in ax2.get_yticklabels():
 sns.despine(ax=ax1, right=False)
 plt.tight_layout()
 
-out = os.path.join(os.path.dirname(__file__), '..', 'figures', 'turn_distribution.png')
+out = os.path.join(os.path.dirname(__file__), '..', '..', 'figures', 'turn_distribution.png')
 plt.savefig(out, dpi=200, bbox_inches='tight')
 print(f"Saved: {out}")

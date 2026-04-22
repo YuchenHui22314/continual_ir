@@ -47,7 +47,7 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 
 import os
-out_path = os.path.join(os.path.dirname(__file__), '..', 'figures', 'root2_pacing.png')
+out_path = os.path.join(os.path.dirname(__file__), '..', '..', 'figures', 'root2_pacing.png')
 plt.savefig(out_path, dpi=150, bbox_inches='tight')
 print(f"Saved: {out_path}")
 
