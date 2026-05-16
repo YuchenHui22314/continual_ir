@@ -1,0 +1,36 @@
+{
+  "purpose": "Verify the Qwen3-Embedding instruction-prefix fix against official MTEB-0.6B numbers and quantify the bug in the original instruction-less eval.",
+  "qwen3_embedding_0.6B_official_mteb_ndcg@10": {
+    "scifact": 0.6972,
+    "trec-covid": 0.9052,
+    "nfcorpus": 0.3671,
+    "fiqa": 0.4661,
+    "arguana": 0.7097,
+    "webis-touche2020": 0.3318,
+    "quora": 0.8778,
+    "scidocs": 0.2441,
+    "nq": 0.5346,
+    "hotpotqa": 0.6574,
+    "dbpedia-entity": 0.3948,
+    "fever": 0.8815,
+    "climate-fever": 0.4211,
+    "msmarco_dev": 0.37994,
+    "beir13_avg": 0.5760,
+    "source": "https://huggingface.co/datasets/mteb/results (Qwen__Qwen3-Embedding-0.6B)"
+  },
+  "beir_zero_shot_verification": {
+    "scifact":    {"no_instruction": 0.6808, "with_instruction": 0.6986, "official": 0.6972},
+    "trec-covid": {"no_instruction": 0.5807, "with_instruction": 0.8916, "official": 0.9052}
+  },
+  "topiocqa_zero_shot_verification": {
+    "no_instruction":   {"NDCG@10": 0.1383, "Recall@100": 0.4376, "MRR@10": 0.1131},
+    "with_instruction": {"NDCG@10": 0.1612, "Recall@100": 0.4789, "MRR@10": 0.1335},
+    "conv_instruction": "Given a conversation, retrieve relevant passages that help answer the user's latest question"
+  },
+  "conclusion": "The original instruction-less eval underestimated zero-shot Qwen3-0.6B by ~11 NDCG@10 points on BEIR-13 avg (46.51 -> ~57.6 official) and up to 32 points on individual datasets (trec-covid). Adding the official per-dataset Instruct: ...\\nQuery:... prefix recovers official performance to within ~1 point. The same instruction-less bug applied to TopiOCQA zero-shot (13.83 -> 16.12 with the conversation template).",
+  "caveats": [
+    "Fine-tuned Qwen3 checkpoints were TRAINED without the instruction prefix (src/data.py); evaluating them WITH instruction is a train/test mismatch. eval_qwen_beir_full.py intentionally keeps the instruction-less path for fine-tuned models.",
+    "Residual ~1.4pt gap on trec-covid vs official is attributable to the non-standard [EOS, tokens, EOS] tokenizer wrapper vs the official single-trailing-EOS; immaterial for a course project.",
+    "figures/qwen_base_eval_results.json still holds the OLD instruction-less zero-shot numbers; regenerate via eval_qwen_base_full.py (now instruction-aware) and delete stale figures/qwen_base_beir_cache.json first."
+  ]
+}

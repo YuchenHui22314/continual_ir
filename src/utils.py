@@ -938,6 +938,57 @@ def build_beir_eval_cache(
     return cache
 
 
+# BEIR dataset name (as used in this codebase) → MTEB task key in task_prompts.json.
+# task_prompts.json holds the official Qwen3-Embedding instructions used for the
+# MTEB leaderboard numbers (arXiv:2506.05176).
+_BEIR_TO_MTEB_TASK = {
+    "scifact":          "SciFact",
+    "trec-covid":       "TRECCOVID",
+    "nfcorpus":         "NFCorpus",
+    "fiqa":             "FiQA2018",
+    "arguana":          "ArguAna",
+    "webis-touche2020": "Touche2020",
+    "quora":            "QuoraRetrieval",
+    "scidocs":          "SCIDOCS",
+    "nq":               "NQ",
+    "hotpotqa":         "HotpotQA",
+    "dbpedia-entity":   "DBPedia",
+    "fever":            "FEVER",
+    "climate-fever":    "ClimateFEVER",
+    "msmarco":          "MSMARCO",
+}
+
+# Default path to the official MTEB instruction file (downloaded by the user).
+DEFAULT_TASK_PROMPTS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "scripts", "task_prompts.json",
+)
+
+
+def build_qwen_instruction_map(task_prompts_path: str = None) -> dict:
+    """
+    Build {beir_dataset_name: instruction_string} from the official MTEB
+    task_prompts.json. Used to wrap Qwen3-Embedding queries as
+    "Instruct: {instruction}\\nQuery:{query}" during BEIR evaluation.
+
+    Some MTEB entries store a {'query': ..., 'passage': ...} dict (e.g. ArguAna);
+    we take the 'query' side, since only queries are instruction-wrapped.
+    """
+    path = task_prompts_path or DEFAULT_TASK_PROMPTS_PATH
+    with open(path, encoding="utf-8") as f:
+        prompts = json.load(f)
+
+    instr_map = {}
+    for beir_name, mteb_key in _BEIR_TO_MTEB_TASK.items():
+        if mteb_key not in prompts:
+            continue
+        val = prompts[mteb_key]
+        if isinstance(val, dict):
+            val = val.get("query") or next(iter(val.values()))
+        instr_map[beir_name] = val
+    return instr_map
+
+
 def eval_beir_from_cache(
     beir_cache:        dict,
     query_encoder,
@@ -950,6 +1001,7 @@ def eval_beir_from_cache(
     keep_faiss_on_gpu: bool = False,
     gpu_index_cache:   dict = None,
     full_eval:         bool = False,
+    query_instruction_map: dict = None,
 ) -> dict:
     """
     Per-epoch BEIR evaluation using pre-loaded in-memory FAISS indices.
@@ -989,12 +1041,26 @@ def eval_beir_from_cache(
         query_ids   = list(queries.keys())
         query_texts = [queries[qid] for qid in query_ids]
 
-        # Encode queries (plain text, not conversational)
+        # Qwen3-Embedding is instruction-aware: the query side must be wrapped as
+        #   "Instruct: {task_description}\nQuery:{query}"
+        # (documents are encoded WITHOUT instruction — see official protocol,
+        #  Qwen3-Embedding tech report arXiv:2506.05176). When a per-dataset
+        # instruction is provided we prepend it and widen the token budget so the
+        # instruction itself is not truncated away.
+        eff_max_length = max_length
+        instr = None
+        if query_instruction_map is not None:
+            instr = query_instruction_map.get(dataset_name)
+        if instr:
+            query_texts = [f"Instruct: {instr}\nQuery:{q}" for q in query_texts]
+            eff_max_length = max(max_length, 512)
+
+        # Encode queries
         all_embs = []
         with torch.no_grad():
             for i in range(0, len(query_texts), eval_batch_size):
                 batch   = query_texts[i : i + eval_batch_size]
-                encoded = tokenizer(batch, max_length=max_length, padding=True,
+                encoded = tokenizer(batch, max_length=eff_max_length, padding=True,
                                     truncation=True, return_tensors="pt")
                 embs = encoder(input_ids=encoded["input_ids"].to(device),
                                attention_mask=encoded["attention_mask"].to(device))

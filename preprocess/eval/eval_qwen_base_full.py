@@ -22,8 +22,18 @@ from transformers import AutoTokenizer, AutoModel
 from utils import (
     build_beir_eval_cache,
     eval_beir_from_cache,
+    build_qwen_instruction_map,
     load_corpus_into_faiss,
     _compute_full_metrics,
+)
+
+# Qwen3-Embedding is instruction-aware. Queries must be wrapped as
+# "Instruct: {task}\nQuery:{q}" (BEIR) or with the conversational template
+# below (TopiOCQA). Documents are encoded WITHOUT instruction.
+# See Qwen3-Embedding tech report arXiv:2506.05176.
+TOPIOCQA_CONV_INSTRUCTION = (
+    "Given a conversation, retrieve relevant passages that help answer "
+    "the user's latest question"
 )
 import numpy as np
 import faiss
@@ -105,7 +115,7 @@ else:
         use_gpu             = False,
     )
 
-    logger.info("Running BEIR eval ...")
+    logger.info("Running BEIR eval (with Qwen3 per-dataset instruction) ...")
     with torch.no_grad():
         beir_metrics = eval_beir_from_cache(
             beir_cache       = beir_cache,
@@ -116,6 +126,7 @@ else:
             use_gpu_faiss    = True,
             keep_faiss_on_gpu= False,
             full_eval        = True,
+            query_instruction_map = build_qwen_instruction_map(),
         )
 
     # free BEIR cache before loading TopiOCQA
@@ -156,8 +167,11 @@ with open(TOPIOCQA_VALID, encoding="utf-8") as f:
         if qid not in topi_qrels:
             continue
         parts = list(rec.get("Context", [])) + [rec["Question"]]
+        conversation = "\n".join(parts)
         topi_qids.append(qid)
-        topi_texts.append("\n".join(parts))
+        topi_texts.append(
+            f"Instruct: {TOPIOCQA_CONV_INSTRUCTION}\nConversation:{conversation}"
+        )
 
 logger.info(f"TopiOCQA: encoding {len(topi_texts)} valid queries ...")
 

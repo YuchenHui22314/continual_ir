@@ -104,7 +104,15 @@ for run_name, label in RUNS.items():
     logger.info(f"Evaluating {run_name} ...")
     tokenizer, encoder = load_encoder(ckpt_path)
 
-    # BEIR — one dataset at a time, free GPU memory after each
+    # BEIR — one dataset at a time, free GPU memory after each.
+    #
+    # NOTE on instruction consistency: these are *fine-tuned* checkpoints. They
+    # were trained (src/data.py) WITHOUT the Qwen3 "Instruct: ...\nQuery:..."
+    # prefix, so we deliberately do NOT pass query_instruction_map here —
+    # evaluating with an instruction the model never saw in Stage-2 training
+    # would be a train/test mismatch. The instruction-aware path is only correct
+    # for the zero-shot base model (see preprocess/eval/eval_qwen_base_full.py).
+    # Fixing this properly requires retraining with the instruction prefix.
     with torch.no_grad():
         beir_metrics = eval_beir_from_cache(
             beir_cache       = beir_cache,
