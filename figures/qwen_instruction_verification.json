@@ -27,7 +27,19 @@
     "with_instruction": {"NDCG@10": 0.1612, "Recall@100": 0.4789, "MRR@10": 0.1335},
     "conv_instruction": "Given a conversation, retrieve relevant passages that help answer the user's latest question"
   },
-  "conclusion": "The original instruction-less eval underestimated zero-shot Qwen3-0.6B by ~11 NDCG@10 points on BEIR-13 avg (46.51 -> ~57.6 official) and up to 32 points on individual datasets (trec-covid). Adding the official per-dataset Instruct: ...\\nQuery:... prefix recovers official performance to within ~1 point. The same instruction-less bug applied to TopiOCQA zero-shot (13.83 -> 16.12 with the conversation template).",
+  "conclusion": "The original instruction-less eval underestimated zero-shot Qwen3-0.6B by ~11 NDCG@10 points on BEIR-13 avg (46.51 -> 57.25 fixed, 57.60 official) and up to 32 points on individual datasets (trec-covid). Adding the official per-dataset Instruct: ...\\nQuery:... prefix recovers official performance. The same instruction-less bug applied to TopiOCQA zero-shot (13.83 -> 16.12 with the conversation template). MSMARCO: 26.37 -> 38.00 (official 37.99, essentially exact).",
+  "refreshed_baseline_full_run": {
+    "topiocqa_ndcg@10": 0.1612,
+    "msmarco_ndcg@10": 0.3800,
+    "beir13_avg": 0.5725,
+    "official_beir13_avg": 0.5760,
+    "note": "figures/qwen_base_eval_results.json regenerated 2026-05-16 with instruction-aware eval; every BEIR dataset within +-1.8 of official, most within +-0.5."
+  },
+  "residual_gap_root_cause": {
+    "is_eos": false,
+    "explanation": "Official sentence-transformers fp32 (exact official recipe) on OUR hardware gives trec-covid 89.51 / scifact 70.04, NOT the MTEB-published 90.52 / 69.72. Our bf16 pipeline (89.16 / 69.86) is within <=0.35 of the official fp32 recipe (pure bf16 numerical noise). The remaining ~1pt vs MTEB-published is NOT bit-reproducible even with official code (MTEB's transformers version / corpus snapshot / seed / hardware). Not a bug, not EOS; methodology is correct.",
+    "ground_truth_st_fp32": {"scifact": 0.7004, "trec-covid": 0.8951}
+  },
   "caveats": [
     "Fine-tuned Qwen3 checkpoints were TRAINED without the instruction prefix (src/data.py); evaluating them WITH instruction is a train/test mismatch. eval_qwen_beir_full.py intentionally keeps the instruction-less path for fine-tuned models.",
     "Residual ~1.4pt gap on trec-covid vs official is attributable to the non-standard [EOS, tokens, EOS] tokenizer wrapper vs the official single-trailing-EOS; immaterial for a course project.",
