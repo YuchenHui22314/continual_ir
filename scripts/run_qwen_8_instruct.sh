@@ -15,6 +15,9 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="${SCRIPT_DIR}/../src/train_qwen_cl.py"
+# Use the project conda env's torchrun (bare `torchrun` resolves to a python
+# without faiss/torch -> ModuleNotFoundError: No module named 'faiss').
+TORCHRUN=/data/rech/huiyuche/envs/trec_ikat/bin/torchrun
 
 TS=$(date +%Y%m%d_%H%M%S)
 LOG_DIR=/data/rech/huiyuche/TREC_iKAT_2024/logs
@@ -55,7 +58,7 @@ for entry in "${RUNS[@]}"; do
 
   CUDA_VISIBLE_DEVICES=0,1,2,3 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  torchrun --nproc_per_node=4 "$TRAIN_SCRIPT" \
+  "$TORCHRUN" --nproc_per_node=4 "$TRAIN_SCRIPT" \
     --pretrained_encoder_path "$PRETRAIN" \
     --training_data_file "$TRAIN_FILE" \
     --pos_neg_embedding_file "$POS_NEG" \
