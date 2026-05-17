@@ -240,14 +240,26 @@ class Topiocqa(BaseDataset):
             else:
                 oracle_utt_tokens = []
             
-            flat_tokens = self.build_conv_query_tokens(
-                tokenizer,
-                cur_utt_text,
-                ctx_utts_text,
-                args.max_query_length,
-                args.max_response_length,
-                args.max_concat_length,
-            )
+            conv_instruction = getattr(args, "conv_instruction", "") or ""
+            if conv_instruction:
+                # Official Qwen3-Embedding instruct-text path. RAW tokenizer
+                # (single trailing <|endoftext|>, last-token pooled); byte-identical
+                # to eval (utils._build_topiocqa_query_tokens with conv_instruction).
+                from utils import build_qwen_instruct_query_ids
+                raw_tok = getattr(tokenizer, "_tok", tokenizer)
+                flat_tokens = build_qwen_instruct_query_ids(
+                    raw_tok, cur_utt_text, ctx_utts_text,
+                    conv_instruction, max_length=args.max_concat_length,
+                )
+            else:
+                flat_tokens = self.build_conv_query_tokens(
+                    tokenizer,
+                    cur_utt_text,
+                    ctx_utts_text,
+                    args.max_query_length,
+                    args.max_response_length,
+                    args.max_concat_length,
+                )
 
             # turn_number: 1 = easiest (no history), increases with conversation depth.
             # Used by curriculum learning to order examples by difficulty.

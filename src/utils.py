@@ -649,6 +649,23 @@ def load_corpus_into_faiss(embedding_dir: str, embed_dim: int = 768, use_gpu: bo
     return index, np.array(all_ids)
 
 
+def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
+                                  instruction, max_length=512):
+    """
+    Official Qwen3-Embedding query path. Builds the text
+
+        Instruct: {instruction}\\nConversation:{ctx_1}\\n...\\n{ctx_n}\\n{cur_utt}
+
+    and tokenizes it with the RAW tokenizer (add_special_tokens=True -> a single
+    trailing <|endoftext|>, last-token pooled). Used by BOTH training (data.py)
+    and evaluation so the train and eval query construction are byte-identical.
+    """
+    conversation = "\n".join(list(ctx_utts_text) + [cur_utt_text])
+    text = f"Instruct: {instruction}\nConversation:{conversation}"
+    return raw_tokenizer.encode(text, add_special_tokens=True,
+                                max_length=max_length, truncation=True)
+
+
 def _build_topiocqa_query_tokens(
     tokenizer,
     cur_utt_text:        str,
@@ -656,12 +673,23 @@ def _build_topiocqa_query_tokens(
     max_query_length:    int = 32,
     max_response_length: int = 32,
     max_concat_length:   int = 512,
+    conv_instruction:    str = "",
 ) -> list:
     """
     Standalone version of Topiocqa.build_conv_query_tokens from data.py.
-    Used in eval_topiocqa() to tokenize valid-set queries without instantiating the dataset class.
-    Format: [CLS] cur_q [SEP] ctx_n [SEP] ... ctx_1 [SEP]  (chronological, bounded by max_concat_length)
+    Used in eval_conv_search() to tokenize valid-set queries without instantiating the dataset class.
+
+    If conv_instruction is non-empty: official Qwen3-Embedding instruct-text path
+    (single trailing <|endoftext|>), byte-identical to training.
+    Otherwise: legacy ANCE-style [CLS] cur_q [SEP] ctx_n [SEP] ... [SEP].
     """
+    if conv_instruction:
+        raw = getattr(tokenizer, "_tok", tokenizer)
+        return build_qwen_instruct_query_ids(
+            raw, cur_utt_text, ctx_utts_text, conv_instruction,
+            max_length=max_concat_length,
+        )
+
     def _tok(text, max_len):
         return tokenizer.encode(text, add_special_tokens=True, max_length=max_len, truncation=True)
 
@@ -762,6 +790,7 @@ def eval_conv_search(
     full_eval:           bool = False,
     left_padding:        bool = False,
     dataset_tag:         str  = "conv",
+    conv_instruction:    str  = "",
 ) -> dict:
     """
     Per-epoch conversational search evaluation using a pre-loaded in-memory FAISS index.
@@ -823,6 +852,7 @@ def eval_conv_search(
                 max_query_length    = max_query_length,
                 max_response_length = max_response_length,
                 max_concat_length   = max_concat_length,
+                conv_instruction    = conv_instruction,
             )
             query_ids.append(qid)
             query_token_lists.append(tokens)
@@ -836,11 +866,17 @@ def eval_conv_search(
             max_len = max(len(s) for s in seqs)
             if left_padding:
                 # Left-pad: required for FlashAttention 2 (Qwen3). Last real token at position -1.
-                rows = [[pad_id] * (max_len - len(s)) + s for s in seqs]
+                rows  = [[pad_id] * (max_len - len(s)) + s for s in seqs]
+                masks = [[0] * (max_len - len(s)) + [1] * len(s) for s in seqs]
             else:
-                rows = [s + [pad_id] * (max_len - len(s)) for s in seqs]
+                rows  = [s + [pad_id] * (max_len - len(s)) for s in seqs]
+                masks = [[1] * len(s) + [0] * (max_len - len(s)) for s in seqs]
             ids_tensor = torch.tensor(rows, dtype=torch.long).to(device)
-            mask = (ids_tensor != pad_id).long()
+            # Build the mask from real sequence lengths, NOT id-equality:
+            # the Qwen3 instruct path ends in <|endoftext|> (151643) which equals
+            # pad_token_id, so (ids != pad_id) would wrongly mask the last real
+            # token and collapse last-token pooling.
+            mask = torch.tensor(masks, dtype=torch.long).to(device)
             embs = encoder(input_ids=ids_tensor, attention_mask=mask)
             embs = F.normalize(embs, p=2, dim=-1)
             all_embs.append(embs.float().cpu().numpy())  # float() handles BF16/FP16 models

@@ -561,6 +561,7 @@ def train(args):
                         gpu_index_cache = _gpu_faiss_cache, full_eval = is_last_epoch,
                         left_padding = True,
                         dataset_tag = "topiocqa",
+                        conv_instruction = args.conv_instruction,
                     )
                 if args.save_to_wandb:
                     if is_last_epoch:
@@ -590,6 +591,7 @@ def train(args):
                         gpu_index_cache = _gpu_faiss_cache, full_eval = is_last_epoch,
                         left_padding = True,
                         dataset_tag = "qrecc",
+                        conv_instruction = args.conv_instruction,
                     )
                 if args.save_to_wandb:
                     if is_last_epoch:
@@ -664,6 +666,13 @@ def get_args():
                         choices=list(PACING_FUNCTIONS.keys()))
     parser.add_argument("--curriculum_c0", type=float, default=0.2)
     parser.add_argument("--curriculum_end_epoch", type=int, default=16)
+    parser.add_argument("--conv_instruction", type=str, default="",
+                        help="If non-empty, build conversational queries with the "
+                             "official Qwen3-Embedding instruct-text path "
+                             "'Instruct: {conv_instruction}\\nConversation:{conv}' "
+                             "(single trailing <|endoftext|>, last-token pooled), "
+                             "byte-identical for training and eval. Empty = legacy "
+                             "[CLS]..[SEP] ANCE-style path.")
 
     # Memory / speed
     parser.add_argument("--use_flash_attention", action="store_true")

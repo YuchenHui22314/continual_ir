@@ -773,6 +773,7 @@ def train(args):
                         gpu_index_cache     = _gpu_faiss_cache,
                         full_eval           = is_last_epoch,
                         dataset_tag         = "topiocqa",
+                        conv_instruction    = getattr(args, "conv_instruction", ""),
                     )
 
                 if args.save_to_wandb:
@@ -814,6 +815,7 @@ def train(args):
                         gpu_index_cache     = _gpu_faiss_cache,
                         full_eval           = is_last_epoch,
                         dataset_tag         = "qrecc",
+                        conv_instruction    = getattr(args, "conv_instruction", ""),
                     )
 
                 if args.save_to_wandb:
@@ -912,6 +914,10 @@ def get_args():
                         help="Initial data fraction (delta_p). Set based on analyze_topiocqa_turns.py output.")
     parser.add_argument("--curriculum_end_epoch", type=int, default=16,
                         help="Epoch at which the full dataset is exposed (pacing_value reaches 1.0).")
+    parser.add_argument("--conv_instruction", type=str, default="",
+                        help="If non-empty, build conversational queries with the official "
+                             "Qwen3-Embedding instruct-text path (single trailing <|endoftext|>). "
+                             "Empty = legacy [CLS]..[SEP] ANCE path (default; ANCE unaffected).")
 
     # ---- Memory / speed optimizations ----
     parser.add_argument("--use_flash_attention", action="store_true",
