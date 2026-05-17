@@ -743,7 +743,7 @@ def _compute_full_metrics(qrels: dict, run: dict) -> dict:
     return metrics
 
 
-def eval_topiocqa(
+def eval_conv_search(
     query_encoder,
     tokenizer,
     test_data_file:      str,
@@ -761,29 +761,31 @@ def eval_topiocqa(
     gpu_index_cache:     dict = None,
     full_eval:           bool = False,
     left_padding:        bool = False,
+    dataset_tag:         str  = "conv",
 ) -> dict:
     """
-    Per-epoch TopiOCQA evaluation using a pre-loaded in-memory FAISS index.
+    Per-epoch conversational search evaluation using a pre-loaded in-memory FAISS index.
     Only re-encodes queries — no corpus disk I/O.
 
     Args:
         query_encoder:   current query encoder (temporarily set to eval mode; DDP-unwrapped)
         tokenizer:       query tokenizer
-        test_data_file:  topiocqa_valid.jsonl  (fields: Conversation_no, Turn_no, Question, Context)
+        test_data_file:  jsonl file with fields Conversation_no, Turn_no, Question, Context
         qrel_file:       TREC qrel (4 columns, no header): "qid 0 doc_id relevance"
-        faiss_index:     pre-loaded FAISS flat-IP CPU index for TopiOCQA corpus
+        faiss_index:     pre-loaded FAISS flat-IP CPU index for the corpus
         doc_ids:         np.array of doc ID strings corresponding to FAISS index rows
         device:          torch device for encoding
         top_k:           number of docs to retrieve per query
         use_gpu_faiss:   if True, transfer faiss_index to GPU (sharded) before searching
         keep_faiss_on_gpu: if True AND use_gpu_faiss, cache the GPU index in gpu_index_cache
                            so subsequent epochs reuse it without re-transfer (saves ~21s/epoch)
-        gpu_index_cache: mutable dict shared with caller — key "topiocqa" stores GPU index.
+        gpu_index_cache: mutable dict shared with caller. dataset_tag is used as cache key.
                          Pass the same dict every epoch so the cache persists.
         full_eval:       if True, compute the full metric suite (MAP, NDCG@1/3/5/10, P@1/3/5/10,
                          Recall@5/50/100/1000, MRR@1/3/5/10) and return as flat dict.
                          Also forces top_k=1000 to support Recall@1000.
                          Use on the final epoch; log results to wandb summary.
+        dataset_tag:     dataset name used in logs and GPU FAISS cache keys.
 
     Returns:
         If full_eval=False: dict {"NDCG@10": float, f"Recall@{top_k}": float, "MRR@10": float}
@@ -843,24 +845,24 @@ def eval_topiocqa(
             embs = F.normalize(embs, p=2, dim=-1)
             all_embs.append(embs.float().cpu().numpy())  # float() handles BF16/FP16 models
 
-    query_embs = np.concatenate(all_embs, axis=0)  # (n_queries, 768)
+    query_embs = np.concatenate(all_embs, axis=0)  # (n_queries, embed_dim)
 
     # FAISS search — optionally move index to GPU for faster search
-    _cache_key = "topiocqa"
+    _cache_key = dataset_tag
     if use_gpu_faiss:
         if keep_faiss_on_gpu and gpu_index_cache is not None and _cache_key in gpu_index_cache:
             # Reuse cached GPU index from a previous epoch
             idx_to_search = gpu_index_cache[_cache_key]
-            logger.info("eval_topiocqa: reusing cached GPU FAISS index.")
+            logger.info(f"eval_conv_search[{dataset_tag}]: reusing cached GPU FAISS index.")
         else:
             # Transfer CPU index → sharded GPU index
-            logger.info("eval_topiocqa: transferring TopiOCQA index to GPU ...")
+            logger.info(f"eval_conv_search[{dataset_tag}]: transferring index to GPU ...")
             co = faiss.GpuMultipleClonerOptions()
             co.shard = True
             idx_to_search = faiss.index_cpu_to_all_gpus(faiss_index, co=co)
             if keep_faiss_on_gpu and gpu_index_cache is not None:
                 gpu_index_cache[_cache_key] = idx_to_search
-                logger.info("eval_topiocqa: GPU index cached (keep_faiss_on_gpu=True).")
+                logger.info(f"eval_conv_search[{dataset_tag}]: GPU index cached (keep_faiss_on_gpu=True).")
         scores, indices = idx_to_search.search(query_embs.astype(np.float32), top_k)
         if not keep_faiss_on_gpu:
             del idx_to_search  # free GPU memory after search
@@ -880,26 +882,35 @@ def eval_topiocqa(
         # Full metric suite for final-epoch summary logging
         metrics = _compute_full_metrics(qrels, run)
         logger.info(
-            f"TopiOCQA full eval: NDCG@10={metrics['NDCG@10']:.4f}  "
+            f"{dataset_tag} full eval: NDCG@10={metrics['NDCG@10']:.4f}  "
             f"Recall@100={metrics['Recall@100']:.4f}  "
             f"MRR@10={metrics['MRR@10']:.4f}  "
             f"MAP@10={metrics['MAP@10']:.4f}"
         )
     else:
         # Lightweight per-epoch eval: NDCG@10, Recall@top_k, MRR@10
-        # MAP@10 == MRR@10 for TopiOCQA (exactly one relevant doc per query)
         retriever = EvaluateRetrieval(None)
         ndcg, _map, recall, _ = retriever.evaluate(qrels, run, [10, top_k])
+        mrr = retriever.evaluate_custom(qrels, run, [10], metric="mrr")
         metrics = {
             "NDCG@10":           ndcg["NDCG@10"],
             f"Recall@{top_k}":   recall[f"Recall@{top_k}"],
-            "MRR@10":            _map["MAP@10"],
+            "MRR@10":            mrr["MRR@10"],
         }
-        logger.info(f"TopiOCQA eval: NDCG@10={metrics['NDCG@10']:.4f}  "
+        logger.info(f"{dataset_tag} eval: NDCG@10={metrics['NDCG@10']:.4f}  "
                     f"Recall@{top_k}={metrics[f'Recall@{top_k}']:.4f}  "
                     f"MRR@10={metrics['MRR@10']:.4f}")
     encoder.train()
     return metrics
+
+
+def eval_topiocqa(*args, **kwargs) -> dict:
+    """
+    Backward-compatible wrapper. New conversational datasets should call
+    eval_conv_search(..., dataset_tag="dataset_name") directly.
+    """
+    kwargs.setdefault("dataset_tag", "topiocqa")
+    return eval_conv_search(*args, **kwargs)
 
 
 def build_beir_eval_cache(

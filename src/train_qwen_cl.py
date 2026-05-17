@@ -37,7 +37,7 @@ from utils import (
     eval_beir_datasets,
     build_beir_eval_cache,
     eval_beir_from_cache,
-    eval_topiocqa,
+    eval_conv_search,
     load_corpus_into_faiss,
     set_seed,
     get_optimizer,
@@ -318,6 +318,8 @@ def train(args):
     beir_eval_cache    = None
     topiocqa_faiss_idx = None
     topiocqa_doc_ids   = None
+    qrecc_faiss_idx    = None
+    qrecc_doc_ids      = None
 
     if is_main_process:
         if args.activate_eval_while_training and len(args.beir_datasets) > 0:
@@ -338,6 +340,20 @@ def train(args):
                 use_gpu       = False,
             )
             logger.info(f"TopiOCQA FAISS ready: {topiocqa_faiss_idx.ntotal} docs.")
+
+        if args.activate_eval_qrecc_while_training:
+            logger.info(f"Loading QReCC corpus into FAISS (embed_dim={args.embed_dim})...")
+            logger.warning(
+                "QReCC full flat FAISS can be very large. "
+                "For Qwen3 1024-dim, 54.6M docs require about 208GiB just for vectors, "
+                "before doc ids and FAISS/Python overhead."
+            )
+            qrecc_faiss_idx, qrecc_doc_ids = load_corpus_into_faiss(
+                embedding_dir = args.qrecc_embedding_dir,
+                embed_dim     = args.embed_dim,
+                use_gpu       = False,
+            )
+            logger.info(f"QReCC FAISS ready: {qrecc_faiss_idx.ntotal} docs.")
 
     _gpu_faiss_cache: dict = {}
 
@@ -533,7 +549,7 @@ def train(args):
 
             if args.activate_eval_topiocqa_while_training and topiocqa_faiss_idx is not None:
                 with torch.no_grad():
-                    topiocqa_metrics = eval_topiocqa(
+                    topiocqa_metrics = eval_conv_search(
                         query_encoder = query_encoder, tokenizer = query_tokenizer,
                         test_data_file = args.topiocqa_valid_file, qrel_file = args.topiocqa_qrel_file,
                         faiss_index = topiocqa_faiss_idx, doc_ids = topiocqa_doc_ids,
@@ -544,6 +560,7 @@ def train(args):
                         use_gpu_faiss = args.use_gpu_faiss, keep_faiss_on_gpu = args.keep_faiss_on_gpu,
                         gpu_index_cache = _gpu_faiss_cache, full_eval = is_last_epoch,
                         left_padding = True,
+                        dataset_tag = "topiocqa",
                     )
                 if args.save_to_wandb:
                     if is_last_epoch:
@@ -551,6 +568,35 @@ def train(args):
                             wandb.run.summary[f"final/topiocqa/{mk}"] = mv
                     else:
                         wandb.log({f"eval/topiocqa_{k}": v for k, v in topiocqa_metrics.items()},
+                                  step=cur_step)
+                gc.collect(); torch.cuda.empty_cache()
+
+            if args.activate_eval_qrecc_while_training and qrecc_faiss_idx is not None:
+                if args.use_gpu_faiss:
+                    logger.warning(
+                        "QReCC full flat index is large. Make sure the current GPUs have enough "
+                        "memory before using --use_gpu_faiss."
+                    )
+                with torch.no_grad():
+                    qrecc_metrics = eval_conv_search(
+                        query_encoder = query_encoder, tokenizer = query_tokenizer,
+                        test_data_file = args.qrecc_valid_file, qrel_file = args.qrecc_qrel_file,
+                        faiss_index = qrecc_faiss_idx, doc_ids = qrecc_doc_ids,
+                        device = args.device, eval_batch_size = args.eval_batch_size,
+                        max_query_length = args.max_query_length,
+                        max_response_length = args.max_response_length,
+                        max_concat_length = args.max_concat_length,
+                        use_gpu_faiss = args.use_gpu_faiss, keep_faiss_on_gpu = args.keep_faiss_on_gpu,
+                        gpu_index_cache = _gpu_faiss_cache, full_eval = is_last_epoch,
+                        left_padding = True,
+                        dataset_tag = "qrecc",
+                    )
+                if args.save_to_wandb:
+                    if is_last_epoch:
+                        for mk, mv in qrecc_metrics.items():
+                            wandb.run.summary[f"final/qrecc/{mk}"] = mv
+                    else:
+                        wandb.log({f"eval/qrecc_{k}": v for k, v in qrecc_metrics.items()},
                                   step=cur_step)
                 gc.collect(); torch.cuda.empty_cache()
 
@@ -647,6 +693,16 @@ def get_args():
     parser.add_argument("--topiocqa_embedding_dir", type=str,
                         default="/part/01/Tmp/yuchen/indexes/topiocqa_qwen_merged",
                         help="Dir with Qwen3 corpus blocks (doc_emb_block.*.pb) for TopiOCQA eval.")
+
+    # QReCC eval
+    parser.add_argument("--activate_eval_qrecc_while_training", action="store_true")
+    parser.add_argument("--qrecc_valid_file", type=str,
+                        default="/data/rech/huiyuche/TREC_iKAT_2024/data/topics/qrecc/qrecc_valid.jsonl")
+    parser.add_argument("--qrecc_qrel_file", type=str,
+                        default="/data/rech/huiyuche/TREC_iKAT_2024/data/qrels/qrecc_qrel.trec")
+    parser.add_argument("--qrecc_embedding_dir", type=str,
+                        default="/data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/qrecc_qwen_merged",
+                        help="Dir with Qwen3 corpus blocks (doc_emb_block.*.pb) for QReCC eval.")
 
     # Misc
     parser.add_argument("--log_print_ratio", type=float, default=0.1)

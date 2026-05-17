@@ -3,6 +3,7 @@ eval_qwen_base_full.py
 ======================
 Evaluate the base (zero-shot) Qwen3-Embedding-0.6B model on:
 - TopiOCQA (NDCG@10)
+- QReCC (NDCG@10)
 - Full BEIR benchmark (14 datasets, cqadupstack excluded)
 
 Saves results to figures/qwen_base_eval_results.json.
@@ -35,6 +36,7 @@ TOPIOCQA_CONV_INSTRUCTION = (
     "Given a conversation, retrieve relevant passages that help answer "
     "the user's latest question"
 )
+QRECC_CONV_INSTRUCTION = TOPIOCQA_CONV_INSTRUCTION
 import numpy as np
 import faiss
 
@@ -51,7 +53,11 @@ BEIR_DATA  = "/data/rech/huiyuche/beir"
 TOPIOCQA_EMB_DIR = "/part/01/Tmp/yuchen/indexes/topiocqa_qwen_merged"
 TOPIOCQA_VALID   = "/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_valid.jsonl"
 TOPIOCQA_QREL    = "/data/rech/huiyuche/TREC_iKAT_2024/data/qrels/topiocqa_qrel.trec"
+QRECC_EMB_DIR    = "/data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/qrecc_qwen_merged"
+QRECC_VALID      = "/data/rech/huiyuche/TREC_iKAT_2024/data/topics/qrecc/qrecc_valid.jsonl"
+QRECC_QREL       = "/data/rech/huiyuche/TREC_iKAT_2024/data/qrels/qrecc_qrel.trec"
 RESULTS_OUT      = "/data/rech/huiyuche/continual_ir/figures/qwen_base_eval_results.json"
+QRECC_USE_GPU_FAISS = False
 
 BEIR_DATASETS = [
     "msmarco", "scifact", "trec-covid", "nfcorpus", "fiqa",
@@ -211,6 +217,91 @@ logger.info(
     f"MRR@10={topi_metrics['MRR@10']:.4f}  "
     f"MAP@10={topi_metrics['MAP@10']:.4f}"
 )
+del topi_index, topi_dids, topi_query_embs
+import gc; gc.collect()
+torch.cuda.empty_cache()
+
+# ── QReCC ─────────────────────────────────────────────────────────────────────
+logger.info(f"Loading QReCC corpus index from {QRECC_EMB_DIR} ...")
+logger.warning(
+    "QReCC full flat FAISS is very large: with Qwen3 1024-dim and ~54.6M docs, "
+    "vectors alone require about 208GiB RAM, before doc ids and FAISS/Python overhead."
+)
+qrecc_index, qrecc_dids = load_corpus_into_faiss(
+    QRECC_EMB_DIR, embed_dim=EMBED_DIM, use_gpu=False,
+)
+
+logger.info("Running QReCC eval (Qwen3 plain-text path) ...")
+QRECC_MAX_LEN = 512
+QRECC_TOPK    = 1000
+
+# 1) qrels
+qrecc_qrels = {}
+with open(QRECC_QREL, encoding="utf-8") as f:
+    for line in f:
+        parts = line.strip().split()
+        if len(parts) < 4:
+            continue
+        qid, did, rel = parts[0], parts[2], int(parts[3])
+        qrecc_qrels.setdefault(qid, {})[did] = rel
+
+# 2) build plain-text conversational queries
+qrecc_qids, qrecc_texts = [], []
+with open(QRECC_VALID, encoding="utf-8") as f:
+    for line in f:
+        rec = json.loads(line.strip())
+        qid = f"{rec['Conversation_no']}-{rec['Turn_no']}"
+        if qid not in qrecc_qrels:
+            continue
+        parts = list(rec.get("Context", [])) + [rec["Question"]]
+        conversation = "\n".join(parts)
+        qrecc_qids.append(qid)
+        qrecc_texts.append(
+            f"Instruct: {QRECC_CONV_INSTRUCTION}\nConversation:{conversation}"
+        )
+
+logger.info(f"QReCC: encoding {len(qrecc_texts)} judged valid queries ...")
+
+# 3) encode queries
+qrecc_embs_list = []
+with torch.no_grad():
+    for i in range(0, len(qrecc_texts), EVAL_BS):
+        batch = qrecc_texts[i : i + EVAL_BS]
+        enc   = tokenizer(batch, max_length=QRECC_MAX_LEN, padding=True,
+                          truncation=True, return_tensors="pt")
+        embs  = encoder(input_ids=enc["input_ids"].to(DEVICE),
+                        attention_mask=enc["attention_mask"].to(DEVICE))
+        qrecc_embs_list.append(embs.float().cpu().numpy())
+qrecc_query_embs = np.concatenate(qrecc_embs_list, axis=0)
+
+# 4) FAISS search
+if QRECC_USE_GPU_FAISS:
+    logger.info("QReCC: transferring index to GPUs (sharded) ...")
+    co = faiss.GpuMultipleClonerOptions()
+    co.shard = True
+    idx_gpu = faiss.index_cpu_to_all_gpus(qrecc_index, co=co)
+    scores, indices = idx_gpu.search(qrecc_query_embs.astype(np.float32), QRECC_TOPK)
+    del idx_gpu
+    torch.cuda.empty_cache()
+else:
+    logger.info("QReCC: searching CPU FAISS index ...")
+    scores, indices = qrecc_index.search(qrecc_query_embs.astype(np.float32), QRECC_TOPK)
+
+# 5) build run dict and compute metrics
+qrecc_run = {}
+for q_idx, qid in enumerate(qrecc_qids):
+    qrecc_run[qid] = {
+        str(qrecc_dids[int(idx)]): float(scores[q_idx, r])
+        for r, idx in enumerate(indices[q_idx])
+        if 0 <= int(idx) < len(qrecc_dids)
+    }
+qrecc_metrics = _compute_full_metrics(qrecc_qrels, qrecc_run)
+logger.info(
+    f"QReCC full eval: NDCG@10={qrecc_metrics['NDCG@10']:.4f}  "
+    f"Recall@100={qrecc_metrics['Recall@100']:.4f}  "
+    f"MRR@10={qrecc_metrics['MRR@10']:.4f}  "
+    f"MAP@10={qrecc_metrics['MAP@10']:.4f}"
+)
 
 # ── save & report ─────────────────────────────────────────────────────────────
 beir_avg = sum(
@@ -218,16 +309,19 @@ beir_avg = sum(
 ) / max(1, sum(1 for k in beir_metrics if k not in BEIR_AVG_EXCLUDE))
 ms_ndcg = beir_metrics.get("msmarco", {}).get("NDCG@10", float("nan"))
 topi_ndcg = topi_metrics.get("NDCG@10", float("nan"))
+qrecc_ndcg = qrecc_metrics.get("NDCG@10", float("nan"))
 
 logger.info(f"\n{'='*60}")
 logger.info(f"Qwen3 (zero-shot) results:")
 logger.info(f"  TopiOCQA NDCG@10      = {topi_ndcg:.4f}")
+logger.info(f"  QReCC NDCG@10         = {qrecc_ndcg:.4f}")
 logger.info(f"  MSMARCO NDCG@10       = {ms_ndcg:.4f}")
 logger.info(f"  Avg BEIR* NDCG@10     = {beir_avg:.4f}")
 
 results = {
     "label":    "Qwen3 (w/o Conv. data)",
     "topiocqa": topi_metrics,
+    "qrecc":    qrecc_metrics,
     "beir":     beir_metrics,
 }
 os.makedirs(os.path.dirname(RESULTS_OUT), exist_ok=True)
@@ -236,4 +330,4 @@ with open(RESULTS_OUT, "w") as f:
 logger.info(f"Results saved to {RESULTS_OUT}")
 
 print(f"\n% Zero-shot Qwen3 row:")
-print(f"  Qwen3 (w/o Conv. data) & {topi_ndcg*100:.2f} & {ms_ndcg*100:.2f} & {beir_avg*100:.2f} \\\\")
+print(f"  Qwen3 (w/o Conv. data) & {topi_ndcg*100:.2f} & {qrecc_ndcg*100:.2f} & {ms_ndcg*100:.2f} & {beir_avg*100:.2f} \\\\")
