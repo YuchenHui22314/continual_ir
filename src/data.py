@@ -34,17 +34,22 @@ def pad_and_mask(seqs, max_length, pad_token_id=0, dynamic=False, left_padding=F
 
     B = len(seqs)
     padded = torch.full((B, target_len), pad_token_id, dtype=torch.long)
+    mask   = torch.zeros((B, target_len), dtype=torch.long)
     for i, s in enumerate(seqs):
         # Truncate if needed
         tokens = s[:max_length] if len(s) > max_length else s
         L = len(tokens)
         if left_padding:
             padded[i, target_len - L:] = torch.tensor(tokens, dtype=torch.long)
+            mask[i,   target_len - L:] = 1
         else:
             padded[i, :L] = torch.tensor(tokens, dtype=torch.long)
+            mask[i,   :L] = 1
 
-    # Attention mask: 1 for real tokens, 0 for padding
-    mask = (padded != pad_token_id).long()
+    # Attention mask built from real sequence lengths, NOT (padded != pad_id):
+    # the Qwen3 instruct query path ends in <|endoftext|> (151643) which equals
+    # pad_token_id, so id-equality would mask the last real token and collapse
+    # last-token pooling (loss stuck at ln(batch); model never learns).
     return padded, mask
 
 
