@@ -32,7 +32,7 @@ TOPIOCQA_VALID=/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_
 TOPIOCQA_QREL=/data/rech/huiyuche/TREC_iKAT_2024/data/qrels/topiocqa_qrel.trec
 OUT_BASE=/data/rech/huiyuche/huggingface/continual_ir
 
-WANDB_PROJECT=topiocqa-qwen-instruct
+WANDB_PROJECT=topiocqa-qwen-instruct-v2
 CONV_INSTR="Given a conversation, retrieve relevant passages that help answer the user's latest question"
 
 # All 8 runs: baseline + 4 easy2hard CL + 3 hard2easy ACL
@@ -52,7 +52,7 @@ echo "wandb project: $WANDB_PROJECT | conv_instruction: $CONV_INSTR" | tee -a "$
 
 for entry in "${RUNS[@]}"; do
   IFS='|' read -r NAME CTYPE PACE <<< "$entry"
-  RUN_NAME="instruct_${NAME}"
+  RUN_NAME="instruct2_${NAME}"
   RUN_LOG=${LOG_DIR}/run_${RUN_NAME}_${TS}.log
   echo "===== [$(date)] START $RUN_NAME (curriculum=$CTYPE, pacing=$PACE) =====" | tee -a "$MASTER_LOG"
 
