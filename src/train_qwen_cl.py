@@ -37,6 +37,7 @@ from utils import (
     eval_beir_datasets,
     build_beir_eval_cache,
     eval_beir_from_cache,
+    build_qwen_instruction_map,
     eval_conv_search,
     load_corpus_into_faiss,
     set_seed,
@@ -320,6 +321,9 @@ def train(args):
     topiocqa_doc_ids   = None
     qrecc_faiss_idx    = None
     qrecc_doc_ids      = None
+    # Per-task official Qwen3 BEIR instructions; passed to eval_beir_from_cache so
+    # in-training BEIR/MSMARCO eval matches the zero-shot baseline's instruction setup.
+    _beir_instruction_map = build_qwen_instruction_map()
 
     if is_main_process:
         if args.activate_eval_while_training and len(args.beir_datasets) > 0:
@@ -530,12 +534,19 @@ def train(args):
                     # BEIR: force keep_faiss_on_gpu=False so each dataset's index is
                     # freed after search. Qwen3 (1024-dim) + TopiOCQA cache + BEIR cache
                     # together overflow 46 GB; loading one at a time peaks at ~40 GB.
+                    # Pass the per-task Qwen3 BEIR instruction map so MSMARCO and
+                    # BEIR datasets are evaluated the same way as the zero-shot
+                    # baseline (apples-to-apples). Without this, in-training MSMARCO
+                    # NDCG@10 looked catastrophically low (~0.13) because the eval
+                    # encoded queries WITHOUT any instruction; with this map enabled
+                    # the post-training eval recovers to ~0.33.
                     metric_numbers = eval_beir_from_cache(
                         beir_cache = beir_eval_cache, query_encoder = query_encoder,
                         tokenizer = query_tokenizer, device = args.device,
                         eval_batch_size = args.eval_batch_size,
                         use_gpu_faiss = args.use_gpu_faiss, keep_faiss_on_gpu = False,
                         gpu_index_cache = _gpu_faiss_cache, full_eval = is_last_epoch,
+                        query_instruction_map = _beir_instruction_map,
                     )
                 if args.save_to_wandb:
                     if is_last_epoch:
