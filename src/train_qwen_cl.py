@@ -679,11 +679,23 @@ def get_args():
     parser.add_argument("--curriculum_end_epoch", type=int, default=16)
     parser.add_argument("--conv_instruction", type=str, default="",
                         help="If non-empty, build conversational queries with the "
-                             "official Qwen3-Embedding instruct-text path "
-                             "'Instruct: {conv_instruction}\\nConversation:{conv}' "
-                             "(single trailing <|endoftext|>, last-token pooled), "
-                             "byte-identical for training and eval. Empty = legacy "
-                             "[CLS]..[SEP] ANCE-style path.")
+                             "official Qwen3-Embedding instruct-text path. The "
+                             "exact template depends on --template_version: "
+                             "v1 (legacy) -> 'Instruct: {conv_instruction}\\n"
+                             "Conversation:{q1}\\n{r1}\\n...{q_cur}<|endoftext|>'; "
+                             "v2 -> 'Instruct: {conv_instruction}\\n"
+                             "Conversation: User: {q1} System: {r1} ... User: {q_cur}"
+                             "<|endoftext|>'. Single trailing <|endoftext|>, "
+                             "last-token pooled, byte-identical for training and eval. "
+                             "Empty = legacy [CLS]..[SEP] ANCE-style path.")
+    parser.add_argument("--template_version", type=str, default="v1",
+                        choices=["v1", "v2"],
+                        help="Conversational instruct template version (see "
+                             "--conv_instruction). v1 (default) is byte-identical "
+                             "to the 2026-05-19 instruct2_qwen_* checkpoint family; "
+                             "v2 (added 2026-06-05) inserts explicit User:/System: "
+                             "role markers and uses single-space turn separators. "
+                             "Ignored when --conv_instruction is empty.")
 
     # Memory / speed
     parser.add_argument("--use_flash_attention", action="store_true")

@@ -646,24 +646,151 @@ def load_corpus_into_faiss(embedding_dir: str, embed_dim: int = 768, use_gpu: bo
 
     logger.info(f"load_corpus_into_faiss: {index.ntotal} total embeddings "
                 f"from {os.path.basename(embedding_dir)}")
-    return index, np.array(all_ids)
+    # dtype=object avoids numpy trying to unify all doc-id strings to a single
+    # fixed-width unicode dtype (e.g. QReCC has some pathologically long doc ids
+    # that would blow up to TBs as <U12672); object array keeps Python strings.
+    return index, np.array(all_ids, dtype=object)
+
+
+# ─── Conversational instruction templates for Qwen3-Embedding ──────────────
+# v1: the original phrasing used to train the 8 instruct2_qwen_* checkpoints
+#     on 2026-05-19. Each context utterance is appended verbatim, joined by
+#     a single newline; no per-turn role markers.
+# v2: refined phrasing introduced 2026-06-05. Each context utterance is
+#     prefixed with a literal `User:` / `System:` role marker and turns are
+#     joined by single spaces. Use for any future training or new zero-shot
+#     evals; OOD for any v1-trained checkpoint.
+CONV_INSTRUCTION_V1 = "Given a conversation, retrieve relevant passages that help answer the user's latest question"
+CONV_INSTRUCTION_V2 = "Given a conversation between a user and an AI assistant, retrieve passages that answer the user's last question."
 
 
 def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
-                                  instruction, max_length=512):
+                                  instruction, max_length=512,
+                                  max_query_length=32, max_response_length=64,
+                                  smart_truncation=True,
+                                  template_version="v1"):
     """
-    Official Qwen3-Embedding query path. Builds the text
+    Official Qwen3-Embedding query path.
 
-        Instruct: {instruction}\\nConversation:{ctx_1}\\n...\\n{ctx_n}\\n{cur_utt}
+    template_version="v1" (DEFAULT, byte-identical to the 2026-05-19 instruct2
+    training):
+        Instruct: {instruction}\\nConversation:{ctx_1}\\n...\\n{ctx_n}\\n{cur_utt}<|endoftext|>
 
-    and tokenizes it with the RAW tokenizer (add_special_tokens=True -> a single
-    trailing <|endoftext|>, last-token pooled). Used by BOTH training (data.py)
-    and evaluation so the train and eval query construction are byte-identical.
+    template_version="v2" (introduced 2026-06-05):
+        Instruct: {instruction}\\nConversation: User: {q_1} System: {r_1} ... User: {q_current}<|endoftext|>
+        - explicit `User: ` / `System: ` role marker before each utterance
+        - single space between utterances (no newline)
+        - a single space follows `Conversation:`, then the first role marker
+        - all v1-trained checkpoints are OOD under v2; use only for zero-shot
+          or for retraining a fresh checkpoint family
+
+    Both versions are last-token pooled by the encoder, with a trailing
+    `<|endoftext|>` (id 151643) appended either by the tokenizer's
+    `add_special_tokens=True` (non-smart path) or manually (smart path).
+
+    smart_truncation=True (default, MIRRORS the training-side TopiOCQA dataloader
+    `data.py:Topiocqa.build_conv_query_tokens`):
+      - prefix `Instruct: {instr}\\nConversation:` (+ trailing space for v2) is reserved
+      - current question is tokenized first with cap max_query_length
+        (priority: kept intact up to the remaining budget)
+      - context items are walked from most-recent backwards; each item capped
+        by max_query_length (queries, even ctx indices) or max_response_length
+        (responses, odd ctx indices); the oldest items are dropped first when
+        the total token budget is exhausted
+      - for v2 the per-utt cost ALSO includes the role-marker tokens
+        (` User: ` / ` System: `), so the effective per-turn overhead is a
+        few tokens larger than under v1
+      - chronological order is restored when emitting
+
+    smart_truncation=False: original naive tokenizer-level right-truncation
+    (`raw.encode(text, truncation=True, max_length=...)`). This drops the END
+    of the text when too long -> the current question is the first thing lost.
+    Kept as an option only for reproducing the pre-fix instruct2 training,
+    where this mostly didn't fire (TopiOCQA conversations are short).
     """
-    conversation = "\n".join(list(ctx_utts_text) + [cur_utt_text])
-    text = f"Instruct: {instruction}\nConversation:{conversation}"
-    return raw_tokenizer.encode(text, add_special_tokens=True,
-                                max_length=max_length, truncation=True)
+    if template_version not in ("v1", "v2"):
+        raise ValueError(f"unknown template_version: {template_version!r}")
+
+    if not smart_truncation:
+        if template_version == "v2":
+            parts = []
+            for j, utt in enumerate(ctx_utts_text):
+                role = "User" if (j % 2 == 0) else "System"
+                parts.append(f"{role}: {utt}")
+            parts.append(f"User: {cur_utt_text}")
+            conversation = " ".join(parts)
+            text = f"Instruct: {instruction}\nConversation: {conversation}"
+        else:
+            conversation = "\n".join(list(ctx_utts_text) + [cur_utt_text])
+            text = f"Instruct: {instruction}\nConversation:{conversation}"
+        return raw_tokenizer.encode(text, add_special_tokens=True,
+                                    max_length=max_length, truncation=True)
+
+    # ─── smart token-level truncation ────────────────────────────────────────
+    EOS_ID = 151643          # <|endoftext|> for Qwen3-Embedding
+    prefix = f"Instruct: {instruction}\nConversation:"
+    prefix_ids = raw_tokenizer.encode(prefix, add_special_tokens=False)
+
+    if template_version == "v2":
+        # Each role marker contains its OWN leading space, so concatenating it
+        # right after `Conversation:` produces `Conversation: User: ...` and
+        # between turns it produces `... {prev_text} User: ...` — i.e. the
+        # role marker itself supplies the turn separator. No extra nl_ids /
+        # space tokens are emitted at the join point.
+        user_prefix_ids   = raw_tokenizer.encode(" User: ",   add_special_tokens=False)
+        system_prefix_ids = raw_tokenizer.encode(" System: ", add_special_tokens=False)
+    else:
+        nl_ids = raw_tokenizer.encode("\n", add_special_tokens=False)
+        nl_len = len(nl_ids)
+
+    # current question (priority — keep all up to budget)
+    cur_text_ids = raw_tokenizer.encode(cur_utt_text, add_special_tokens=False,
+                                        max_length=max_query_length, truncation=True)
+    if template_version == "v2":
+        # the current utterance always carries the User role marker
+        cur_block_ids = user_prefix_ids + cur_text_ids
+    else:
+        cur_block_ids = cur_text_ids
+
+    # remaining budget for context items (after prefix, current, eos)
+    budget = max_length - len(prefix_ids) - len(cur_block_ids) - 1
+    if budget < 0:
+        # current question alone overflows — hard-truncate it
+        if template_version == "v2":
+            keep = max_length - len(prefix_ids) - len(user_prefix_ids) - 1
+            cur_text_ids = cur_text_ids[: max(0, keep)]
+            return prefix_ids + user_prefix_ids + cur_text_ids + [EOS_ID]
+        else:
+            cur_text_ids = cur_text_ids[: max_length - len(prefix_ids) - 1]
+            return prefix_ids + cur_text_ids + [EOS_ID]
+
+    # walk context backwards, prepend with per-utt caps; drop oldest first
+    selected = []   # newest -> oldest; reversed back to chronological at emit
+    used = 0
+    for j in range(len(ctx_utts_text) - 1, -1, -1):
+        per_utt = max_response_length if (j % 2 == 1) else max_query_length
+        item_ids = raw_tokenizer.encode(ctx_utts_text[j], add_special_tokens=False,
+                                        max_length=per_utt, truncation=True)
+        if template_version == "v2":
+            role_ids = system_prefix_ids if (j % 2 == 1) else user_prefix_ids
+            block_ids = role_ids + item_ids
+            cost = len(block_ids)
+        else:
+            block_ids = item_ids
+            cost = len(item_ids) + nl_len    # "\n" separator joins this item to the next
+        if used + cost > budget:
+            break
+        selected.append(block_ids)
+        used += cost
+
+    ids = list(prefix_ids)
+    for seg in reversed(selected):
+        ids += seg
+        if template_version == "v1":
+            ids += nl_ids
+    ids += cur_block_ids
+    ids.append(EOS_ID)
+    return ids
 
 
 def _build_topiocqa_query_tokens(
@@ -674,20 +801,39 @@ def _build_topiocqa_query_tokens(
     max_response_length: int = 32,
     max_concat_length:   int = 512,
     conv_instruction:    str = "",
+    template_version:    str = "v1",
 ) -> list:
     """
     Standalone version of Topiocqa.build_conv_query_tokens from data.py.
     Used in eval_conv_search() to tokenize valid-set queries without instantiating the dataset class.
 
     If conv_instruction is non-empty: official Qwen3-Embedding instruct-text path
-    (single trailing <|endoftext|>), byte-identical to training.
-    Otherwise: legacy ANCE-style [CLS] cur_q [SEP] ctx_n [SEP] ... [SEP].
+    (single trailing <|endoftext|>), byte-identical to training when
+    template_version matches the version the checkpoint was trained on
+    (see build_qwen_instruct_query_ids for the v1/v2 spec).
+    Otherwise: legacy ANCE-style [CLS] cur_q [SEP] ctx_n [SEP] ... [SEP]
+    (template_version is ignored in this branch).
     """
     if conv_instruction:
         raw = getattr(tokenizer, "_tok", tokenizer)
+        kwargs = dict(max_length=max_concat_length,
+                      template_version=template_version)
+        if template_version != "v1":
+            # v1 has a long-standing pre-existing quirk: the caller-supplied
+            # max_query_length / max_response_length are NOT forwarded into
+            # build_qwen_instruct_query_ids, so the function defaults (32/64)
+            # are used regardless. Training (data.py:248-258) goes through
+            # the same code path with the same omission, so train/eval are
+            # internally consistent at 32/64/{max_concat_length}. We preserve
+            # this byte-identically under v1 so any v1-trained checkpoint
+            # keeps reproducing the published numbers.
+            #
+            # v2 is a new code path with no legacy, so it forwards the caller's
+            # caps as the user-facing API contract suggests.
+            kwargs["max_query_length"]    = max_query_length
+            kwargs["max_response_length"] = max_response_length
         return build_qwen_instruct_query_ids(
-            raw, cur_utt_text, ctx_utts_text, conv_instruction,
-            max_length=max_concat_length,
+            raw, cur_utt_text, ctx_utts_text, conv_instruction, **kwargs,
         )
 
     def _tok(text, max_len):
@@ -791,6 +937,8 @@ def eval_conv_search(
     left_padding:        bool = False,
     dataset_tag:         str  = "conv",
     conv_instruction:    str  = "",
+    use_gpu_fp16:        bool = False,
+    template_version:    str  = "v1",
 ) -> dict:
     """
     Per-epoch conversational search evaluation using a pre-loaded in-memory FAISS index.
@@ -853,6 +1001,7 @@ def eval_conv_search(
                 max_response_length = max_response_length,
                 max_concat_length   = max_concat_length,
                 conv_instruction    = conv_instruction,
+                template_version    = template_version,
             )
             query_ids.append(qid)
             query_token_lists.append(tokens)
@@ -892,9 +1041,11 @@ def eval_conv_search(
             logger.info(f"eval_conv_search[{dataset_tag}]: reusing cached GPU FAISS index.")
         else:
             # Transfer CPU index → sharded GPU index
-            logger.info(f"eval_conv_search[{dataset_tag}]: transferring index to GPU ...")
+            logger.info(f"eval_conv_search[{dataset_tag}]: transferring index to GPU "
+                        f"(useFloat16={use_gpu_fp16}) ...")
             co = faiss.GpuMultipleClonerOptions()
             co.shard = True
+            co.useFloat16 = use_gpu_fp16
             idx_to_search = faiss.index_cpu_to_all_gpus(faiss_index, co=co)
             if keep_faiss_on_gpu and gpu_index_cache is not None:
                 gpu_index_cache[_cache_key] = idx_to_search
@@ -1049,6 +1200,7 @@ def eval_beir_from_cache(
     gpu_index_cache:   dict = None,
     full_eval:         bool = False,
     query_instruction_map: dict = None,
+    use_gpu_fp16:      bool = False,
 ) -> dict:
     """
     Per-epoch BEIR evaluation using pre-loaded in-memory FAISS indices.
@@ -1124,9 +1276,11 @@ def eval_beir_from_cache(
                 logger.info(f"  eval_beir_from_cache {dataset_name}: reusing cached GPU index.")
             else:
                 # Transfer CPU index → sharded GPU index
-                logger.info(f"  eval_beir_from_cache {dataset_name}: transferring index to GPU ...")
+                logger.info(f"  eval_beir_from_cache {dataset_name}: transferring index to GPU "
+                            f"(useFloat16={use_gpu_fp16}) ...")
                 co = faiss.GpuMultipleClonerOptions()
                 co.shard = True
+                co.useFloat16 = use_gpu_fp16
                 idx_to_search = faiss.index_cpu_to_all_gpus(faiss_idx, co=co)
                 if keep_faiss_on_gpu and gpu_index_cache is not None:
                     gpu_index_cache[dataset_name] = idx_to_search

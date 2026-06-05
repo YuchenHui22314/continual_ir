@@ -246,15 +246,30 @@ class Topiocqa(BaseDataset):
                 oracle_utt_tokens = []
             
             conv_instruction = getattr(args, "conv_instruction", "") or ""
+            template_version = getattr(args, "template_version", "v1") or "v1"
             if conv_instruction:
                 # Official Qwen3-Embedding instruct-text path. RAW tokenizer
                 # (single trailing <|endoftext|>, last-token pooled); byte-identical
                 # to eval (utils._build_topiocqa_query_tokens with conv_instruction).
+                # template_version=v1 (legacy) keeps the original wording and
+                # newline-joined turns; v2 (added 2026-06-05) switches to the
+                # `User: ... System: ...` role-marker template — see
+                # utils.build_qwen_instruct_query_ids.
                 from utils import build_qwen_instruct_query_ids
                 raw_tok = getattr(tokenizer, "_tok", tokenizer)
+                kwargs = dict(max_length=args.max_concat_length,
+                              template_version=template_version)
+                if template_version != "v1":
+                    # Match the same v1 quirk preserved in utils._build_topiocqa_query_tokens:
+                    # v1 silently uses build_qwen_instruct_query_ids' built-in defaults
+                    # (32/64) for max_query_length / max_response_length so that train==eval
+                    # for the existing instruct2 checkpoint family. v2 has no legacy, so
+                    # we forward the configured caps as the args advertise.
+                    kwargs["max_query_length"]    = args.max_query_length
+                    kwargs["max_response_length"] = args.max_response_length
                 flat_tokens = build_qwen_instruct_query_ids(
                     raw_tok, cur_utt_text, ctx_utts_text,
-                    conv_instruction, max_length=args.max_concat_length,
+                    conv_instruction, **kwargs,
                 )
             else:
                 flat_tokens = self.build_conv_query_tokens(

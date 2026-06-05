@@ -13,7 +13,7 @@ Usage (from continual_ir/):
         2>&1 | tee /data/rech/huiyuche/TREC_iKAT_2024/logs/eval_qwen_base.log
 """
 
-import sys, os, json, logging
+import sys, os, json, logging, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 import torch
@@ -26,16 +26,30 @@ from utils import (
     build_qwen_instruction_map,
     load_corpus_into_faiss,
     _compute_full_metrics,
+    CONV_INSTRUCTION_V1,
+    CONV_INSTRUCTION_V2,
 )
+
+# CLI — pick conversational template version. v1 (default) reproduces the
+# 2026-05-16 zero-shot baseline numbers (TopiOCQA 16.12 / QReCC 4.79 / BEIR
+# avg 57.25) byte-identically; v2 swaps in the role-marker template added
+# 2026-06-05. BEIR / MS~MARCO eval is unaffected by template_version since
+# those use build_qwen_instruction_map for per-task official MTEB prompts.
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--template_version", type=str, default="v1",
+                 choices=["v1", "v2"],
+                 help="Conversational instruct template for the TopiOCQA "
+                      "and QReCC sections (see src/utils.py:"
+                      "build_qwen_instruct_query_ids).")
+_args = _ap.parse_args()
+TEMPLATE_VERSION = _args.template_version
 
 # Qwen3-Embedding is instruction-aware. Queries must be wrapped as
 # "Instruct: {task}\nQuery:{q}" (BEIR) or with the conversational template
-# below (TopiOCQA). Documents are encoded WITHOUT instruction.
+# (TopiOCQA / QReCC). Documents are encoded WITHOUT instruction.
 # See Qwen3-Embedding tech report arXiv:2506.05176.
-TOPIOCQA_CONV_INSTRUCTION = (
-    "Given a conversation, retrieve relevant passages that help answer "
-    "the user's latest question"
-)
+TOPIOCQA_CONV_INSTRUCTION = (CONV_INSTRUCTION_V1
+                             if TEMPLATE_VERSION == "v1" else CONV_INSTRUCTION_V2)
 QRECC_CONV_INSTRUCTION = TOPIOCQA_CONV_INSTRUCTION
 import numpy as np
 import faiss
@@ -56,7 +70,10 @@ TOPIOCQA_QREL    = "/data/rech/huiyuche/TREC_iKAT_2024/data/qrels/topiocqa_qrel.
 QRECC_EMB_DIR    = "/data/rech/huiyuche/TREC_iKAT_2024/data/embeddings/qrecc_qwen_merged"
 QRECC_VALID      = "/data/rech/huiyuche/TREC_iKAT_2024/data/topics/qrecc/qrecc_valid.jsonl"
 QRECC_QREL       = "/data/rech/huiyuche/TREC_iKAT_2024/data/qrels/qrecc_qrel.trec"
-RESULTS_OUT      = "/data/rech/huiyuche/continual_ir/figures/qwen_base_eval_results.json"
+RESULTS_OUT      = ("/data/rech/huiyuche/continual_ir/figures/"
+                    "qwen_base_eval_results"
+                    + ("" if TEMPLATE_VERSION == "v1" else f"_{TEMPLATE_VERSION}")
+                    + ".json")
 QRECC_USE_GPU_FAISS = False
 
 BEIR_DATASETS = [
@@ -79,14 +96,16 @@ class QwenQueryEncoder(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask):
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        seq_len = attention_mask.sum(dim=1) - 1
-        hidden  = out.last_hidden_state
-        emb     = hidden[torch.arange(hidden.size(0)), seq_len]
-        return F.normalize(emb, p=2, dim=-1)
+        # Match training: left-padded last-token pool, fp32 normalize.
+        embs = out.last_hidden_state[:, -1, :]
+        return F.normalize(embs.float(), p=2, dim=-1)
 
 
 logger.info(f"Loading base Qwen3 encoder from {BASE_MODEL}")
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+# Match training: left-pad so QwenQueryEncoder.forward's `last_hidden_state[:, -1, :]`
+# pool always lands on the last real token, regardless of batch heterogeneity.
+tokenizer.padding_side = "left"
 
 # Qwen3 tokenizer has no CLS/SEP tokens — fall back to BOS/EOS so the
 # TopiOCQA query builder (utils._build_topiocqa_query_tokens) doesn't insert None.
@@ -172,12 +191,25 @@ with open(TOPIOCQA_VALID, encoding="utf-8") as f:
         qid = f"{rec['Conversation_no']}-{rec['Turn_no']}"
         if qid not in topi_qrels:
             continue
-        parts = list(rec.get("Context", [])) + [rec["Question"]]
-        conversation = "\n".join(parts)
+        ctx_utts = list(rec.get("Context", []))
+        cur_utt  = rec["Question"]
         topi_qids.append(qid)
-        topi_texts.append(
-            f"Instruct: {TOPIOCQA_CONV_INSTRUCTION}\nConversation:{conversation}"
-        )
+        if TEMPLATE_VERSION == "v2":
+            # role-marker template (mirrors utils.build_qwen_instruct_query_ids' non-smart path)
+            seg = []
+            for j, utt in enumerate(ctx_utts):
+                role = "User" if (j % 2 == 0) else "System"
+                seg.append(f"{role}: {utt}")
+            seg.append(f"User: {cur_utt}")
+            conversation = " ".join(seg)
+            topi_texts.append(
+                f"Instruct: {TOPIOCQA_CONV_INSTRUCTION}\nConversation: {conversation}"
+            )
+        else:
+            conversation = "\n".join(ctx_utts + [cur_utt])
+            topi_texts.append(
+                f"Instruct: {TOPIOCQA_CONV_INSTRUCTION}\nConversation:{conversation}"
+            )
 
 logger.info(f"TopiOCQA: encoding {len(topi_texts)} valid queries ...")
 
@@ -253,12 +285,24 @@ with open(QRECC_VALID, encoding="utf-8") as f:
         qid = f"{rec['Conversation_no']}-{rec['Turn_no']}"
         if qid not in qrecc_qrels:
             continue
-        parts = list(rec.get("Context", [])) + [rec["Question"]]
-        conversation = "\n".join(parts)
+        ctx_utts = list(rec.get("Context", []))
+        cur_utt  = rec["Question"]
         qrecc_qids.append(qid)
-        qrecc_texts.append(
-            f"Instruct: {QRECC_CONV_INSTRUCTION}\nConversation:{conversation}"
-        )
+        if TEMPLATE_VERSION == "v2":
+            seg = []
+            for j, utt in enumerate(ctx_utts):
+                role = "User" if (j % 2 == 0) else "System"
+                seg.append(f"{role}: {utt}")
+            seg.append(f"User: {cur_utt}")
+            conversation = " ".join(seg)
+            qrecc_texts.append(
+                f"Instruct: {QRECC_CONV_INSTRUCTION}\nConversation: {conversation}"
+            )
+        else:
+            conversation = "\n".join(ctx_utts + [cur_utt])
+            qrecc_texts.append(
+                f"Instruct: {QRECC_CONV_INSTRUCTION}\nConversation:{conversation}"
+            )
 
 logger.info(f"QReCC: encoding {len(qrecc_texts)} judged valid queries ...")
 
