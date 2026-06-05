@@ -62,16 +62,20 @@ class QwenQueryEncoder(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask):
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        # last-token pooling (left-padded → last non-pad token = position -1)
-        seq_len = attention_mask.sum(dim=1) - 1          # index of last real token
-        hidden  = out.last_hidden_state                  # (B, L, H)
-        emb     = hidden[torch.arange(hidden.size(0)), seq_len]  # (B, H)
-        return F.normalize(emb, p=2, dim=-1)
+        # Match training: left-padded last-token pool, fp32 normalize.
+        # NOTE: the previous `attention_mask.sum(dim=1)-1` indexing was
+        # RIGHT-padding semantics and points into the pad region under
+        # tokenizer.padding_side='left'. Use position -1 instead.
+        embs = out.last_hidden_state[:, -1, :]           # (B, H)
+        return F.normalize(embs.float(), p=2, dim=-1)
 
 
 def load_encoder(ckpt_path):
     logger.info(f"Loading encoder from {ckpt_path}")
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+    # Match training: left-pad so QwenQueryEncoder.forward's `last_hidden_state[:, -1, :]`
+    # pool always lands on the last real token, regardless of batch heterogeneity.
+    tokenizer.padding_side = "left"
     base = AutoModel.from_pretrained(
         ckpt_path,
         attn_implementation="flash_attention_2",
