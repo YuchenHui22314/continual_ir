@@ -10,8 +10,11 @@
 #      is truncated. TopiOCQA training conversations are well under 1k
 #      tokens, so this is effectively "no truncation".
 #   3. --beir_datasets msmarco (climate-fever dropped from in-training eval).
-#   4. --keep_faiss_on_gpu so the 25M-doc TopiOCQA index stays GPU-resident
-#      across all 20 epochs instead of being re-transferred each epoch.
+#   4. (REMOVED 2026-06-06 after epoch-2 OOM on first attempt:
+#      --keep_faiss_on_gpu sounded like a free win but the cached
+#      ~13 GB/GPU TopiOCQA index collides with FA2+grad-ckpt activation
+#      memory when caps > 512. Per-epoch re-transfer costs ~30 s and is
+#      preferable to a crashed run. See SKILL.md gotchas.)
 #
 # Naming kept separate from instruct2 so nothing collides:
 #   - wandb project:   topiocqa-qwen-instruct-v3
@@ -57,7 +60,7 @@ echo "wandb project: $WANDB_PROJECT" | tee -a "$MASTER_LOG"
 echo "conv_instruction: $CONV_INSTR" | tee -a "$MASTER_LOG"
 echo "template_version: v3" | tee -a "$MASTER_LOG"
 echo "in-training BEIR datasets: msmarco (climate-fever dropped)" | tee -a "$MASTER_LOG"
-echo "FAISS index cached on GPU across epochs (--keep_faiss_on_gpu)" | tee -a "$MASTER_LOG"
+echo "FAISS index NOT cached on GPU (per-epoch re-transfer; collides with training activations under caps>512)" | tee -a "$MASTER_LOG"
 echo "truncation caps: 32768 / 32768 / 32768 (Qwen3-Embedding native ctx; effectively no truncation for TopiOCQA)" | tee -a "$MASTER_LOG"
 
 for entry in "${RUNS[@]}"; do
@@ -102,7 +105,6 @@ for entry in "${RUNS[@]}"; do
     --beir_datasets msmarco \
     --eval_batch_size 64 \
     --use_gpu_faiss \
-    --keep_faiss_on_gpu \
     --n_gpu 4 \
     --save_to_wandb \
     --wandb_name "$RUN_NAME" \
