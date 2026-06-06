@@ -660,8 +660,12 @@ def load_corpus_into_faiss(embedding_dir: str, embed_dim: int = 768, use_gpu: bo
 #     prefixed with a literal `User:` / `System:` role marker and turns are
 #     joined by single spaces. Use for any future training or new zero-shot
 #     evals; OOD for any v1-trained checkpoint.
+# v3: identical to v2 EXCEPT the current (last) user utterance is prefixed
+#     with `User's last question:` instead of `User:`, so its label matches
+#     the instruction phrase verbatim. Same instruction text as v2.
 CONV_INSTRUCTION_V1 = "Given a conversation, retrieve relevant passages that help answer the user's latest question"
 CONV_INSTRUCTION_V2 = "Given a conversation between a user and an AI assistant, retrieve passages that answer the user's last question."
+CONV_INSTRUCTION_V3 = CONV_INSTRUCTION_V2
 
 
 def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
@@ -684,7 +688,12 @@ def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
         - all v1-trained checkpoints are OOD under v2; use only for zero-shot
           or for retraining a fresh checkpoint family
 
-    Both versions are last-token pooled by the encoder, with a trailing
+    template_version="v3" (introduced 2026-06-05):
+        identical to v2 EXCEPT the current utterance carries the literal
+        prefix `User's last question: ` (matching the instruction phrase) instead
+        of `User: `. Same conv_instruction string as v2.
+
+    All versions are last-token pooled by the encoder, with a trailing
     `<|endoftext|>` (id 151643) appended either by the tokenizer's
     `add_special_tokens=True` (non-smart path) or manually (smart path).
 
@@ -708,16 +717,17 @@ def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
     Kept as an option only for reproducing the pre-fix instruct2 training,
     where this mostly didn't fire (TopiOCQA conversations are short).
     """
-    if template_version not in ("v1", "v2"):
+    if template_version not in ("v1", "v2", "v3"):
         raise ValueError(f"unknown template_version: {template_version!r}")
 
     if not smart_truncation:
-        if template_version == "v2":
+        if template_version in ("v2", "v3"):
             parts = []
             for j, utt in enumerate(ctx_utts_text):
                 role = "User" if (j % 2 == 0) else "System"
                 parts.append(f"{role}: {utt}")
-            parts.append(f"User: {cur_utt_text}")
+            cur_role = "User's last question" if template_version == "v3" else "User"
+            parts.append(f"{cur_role}: {cur_utt_text}")
             conversation = " ".join(parts)
             text = f"Instruct: {instruction}\nConversation: {conversation}"
         else:
@@ -731,7 +741,7 @@ def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
     prefix = f"Instruct: {instruction}\nConversation:"
     prefix_ids = raw_tokenizer.encode(prefix, add_special_tokens=False)
 
-    if template_version == "v2":
+    if template_version in ("v2", "v3"):
         # Each role marker contains its OWN leading space, so concatenating it
         # right after `Conversation:` produces `Conversation: User: ...` and
         # between turns it produces `... {prev_text} User: ...` — i.e. the
@@ -739,6 +749,14 @@ def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
         # space tokens are emitted at the join point.
         user_prefix_ids   = raw_tokenizer.encode(" User: ",   add_special_tokens=False)
         system_prefix_ids = raw_tokenizer.encode(" System: ", add_special_tokens=False)
+        # v3 differs from v2 only in the marker for the CURRENT (last) user
+        # utterance — it gets `User's last question: ` instead of `User: ` so
+        # the marker matches the instruction phrase verbatim.
+        if template_version == "v3":
+            cur_role_prefix_ids = raw_tokenizer.encode(
+                " User's last question: ", add_special_tokens=False)
+        else:
+            cur_role_prefix_ids = user_prefix_ids
     else:
         nl_ids = raw_tokenizer.encode("\n", add_special_tokens=False)
         nl_len = len(nl_ids)
@@ -746,9 +764,9 @@ def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
     # current question (priority — keep all up to budget)
     cur_text_ids = raw_tokenizer.encode(cur_utt_text, add_special_tokens=False,
                                         max_length=max_query_length, truncation=True)
-    if template_version == "v2":
-        # the current utterance always carries the User role marker
-        cur_block_ids = user_prefix_ids + cur_text_ids
+    if template_version in ("v2", "v3"):
+        # the current utterance carries the (version-specific) role marker
+        cur_block_ids = cur_role_prefix_ids + cur_text_ids
     else:
         cur_block_ids = cur_text_ids
 
@@ -756,10 +774,10 @@ def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
     budget = max_length - len(prefix_ids) - len(cur_block_ids) - 1
     if budget < 0:
         # current question alone overflows — hard-truncate it
-        if template_version == "v2":
-            keep = max_length - len(prefix_ids) - len(user_prefix_ids) - 1
+        if template_version in ("v2", "v3"):
+            keep = max_length - len(prefix_ids) - len(cur_role_prefix_ids) - 1
             cur_text_ids = cur_text_ids[: max(0, keep)]
-            return prefix_ids + user_prefix_ids + cur_text_ids + [EOS_ID]
+            return prefix_ids + cur_role_prefix_ids + cur_text_ids + [EOS_ID]
         else:
             cur_text_ids = cur_text_ids[: max_length - len(prefix_ids) - 1]
             return prefix_ids + cur_text_ids + [EOS_ID]
@@ -771,7 +789,9 @@ def build_qwen_instruct_query_ids(raw_tokenizer, cur_utt_text, ctx_utts_text,
         per_utt = max_response_length if (j % 2 == 1) else max_query_length
         item_ids = raw_tokenizer.encode(ctx_utts_text[j], add_special_tokens=False,
                                         max_length=per_utt, truncation=True)
-        if template_version == "v2":
+        if template_version in ("v2", "v3"):
+            # history turns always use plain User: / System: in BOTH v2 and v3;
+            # only the current (last) user utterance differs between them.
             role_ids = system_prefix_ids if (j % 2 == 1) else user_prefix_ids
             block_ids = role_ids + item_ids
             cost = len(block_ids)

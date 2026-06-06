@@ -689,13 +689,15 @@ def get_args():
                              "last-token pooled, byte-identical for training and eval. "
                              "Empty = legacy [CLS]..[SEP] ANCE-style path.")
     parser.add_argument("--template_version", type=str, default="v1",
-                        choices=["v1", "v2"],
+                        choices=["v1", "v2", "v3"],
                         help="Conversational instruct template version (see "
                              "--conv_instruction). v1 (default) is byte-identical "
                              "to the 2026-05-19 instruct2_qwen_* checkpoint family; "
                              "v2 (added 2026-06-05) inserts explicit User:/System: "
-                             "role markers and uses single-space turn separators. "
-                             "Ignored when --conv_instruction is empty.")
+                             "role markers and uses single-space turn separators; "
+                             "v3 (added 2026-06-05) is v2 plus the trailing user "
+                             "utterance gets `User's last question:` instead of "
+                             "`User:`. Ignored when --conv_instruction is empty.")
 
     # Memory / speed
     parser.add_argument("--use_flash_attention", action="store_true")

@@ -1,0 +1,26 @@
+{
+  "template_version": "v3",
+  "conv_instruction": "Given a conversation between a user and an AI assistant, retrieve passages that answer the user's last question.",
+  "max_query_length": 64,
+  "max_response_length": 64,
+  "max_concat_length": 512,
+  "topiocqa": {
+    "MAP@10": 0.20622,
+    "NDCG@1": 0.13166,
+    "NDCG@3": 0.20079,
+    "NDCG@5": 0.22236,
+    "NDCG@10": 0.24919,
+    "P@1": 0.13166,
+    "P@3": 0.08393,
+    "P@5": 0.06086,
+    "P@10": 0.03874,
+    "Recall@5": 0.3043,
+    "Recall@50": 0.56762,
+    "Recall@100": 0.63087,
+    "Recall@1000": 0.78441,
+    "MRR@1": 0.13166,
+    "MRR@3": 0.18324,
+    "MRR@5": 0.19517,
+    "MRR@10": 0.20622
+  }
+}

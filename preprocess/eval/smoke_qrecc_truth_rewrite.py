@@ -31,7 +31,8 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModel
 from beir.retrieval.evaluation import EvaluateRetrieval
 
-from utils import load_corpus_into_faiss, CONV_INSTRUCTION_V1, CONV_INSTRUCTION_V2
+from utils import (load_corpus_into_faiss,
+                   CONV_INSTRUCTION_V1, CONV_INSTRUCTION_V2, CONV_INSTRUCTION_V3)
 import faiss
 
 logging.basicConfig(level=logging.INFO,
@@ -44,7 +45,7 @@ log = logging.getLogger(__name__)
 # role-marker template introduced 2026-06-05.
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--template_version", type=str, default="v1",
-                 choices=["v1", "v2"],
+                 choices=["v1", "v2", "v3"],
                  help="Conversational template for variant A. v1=legacy "
                       "newline-joined; v2=User:/System: role markers, single "
                       "space turn separator. v1-trained checkpoints are OOD "
@@ -64,7 +65,9 @@ OUT_JSON   = ("/data/rech/huiyuche/continual_ir/figures/"
 
 # Variant A uses the conversational instruction (v1 or v2). Variant B is a
 # single-query format unaffected by the template change.
-CONV_INSTR = CONV_INSTRUCTION_V1 if TEMPLATE_VERSION == "v1" else CONV_INSTRUCTION_V2
+CONV_INSTR = {"v1": CONV_INSTRUCTION_V1,
+              "v2": CONV_INSTRUCTION_V2,
+              "v3": CONV_INSTRUCTION_V3}[TEMPLATE_VERSION]
 QUERY_INSTR = "Given a question, retrieve relevant passages that answer the question"
 
 EMBED_DIM = 1024
@@ -131,12 +134,14 @@ with open(QRECC_VAL) as f:
         # the construction here (instead of calling build_qwen_instruct_query_ids)
         # to keep the v1 byte sequence identical to the original smoke; the v2
         # branch mirrors utils.build_qwen_instruct_query_ids' non-smart path.
-        if TEMPLATE_VERSION == "v2":
+        if TEMPLATE_VERSION in ("v2", "v3"):
             parts = []
             for j, utt in enumerate(ctx):
                 role = "User" if (j % 2 == 0) else "System"
                 parts.append(f"{role}: {utt}")
-            parts.append(f"User: {cur}")
+            # v3 differs from v2 only in the marker on the trailing user utterance.
+            cur_role = "User's last question" if TEMPLATE_VERSION == "v3" else "User"
+            parts.append(f"{cur_role}: {cur}")
             conv = " ".join(parts)
             q_text_A.append(f"Instruct: {CONV_INSTR}\nConversation: {conv}")
         else:

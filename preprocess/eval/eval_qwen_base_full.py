@@ -28,6 +28,7 @@ from utils import (
     _compute_full_metrics,
     CONV_INSTRUCTION_V1,
     CONV_INSTRUCTION_V2,
+    CONV_INSTRUCTION_V3,
 )
 
 # CLI — pick conversational template version. v1 (default) reproduces the
@@ -37,7 +38,7 @@ from utils import (
 # those use build_qwen_instruction_map for per-task official MTEB prompts.
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--template_version", type=str, default="v1",
-                 choices=["v1", "v2"],
+                 choices=["v1", "v2", "v3"],
                  help="Conversational instruct template for the TopiOCQA "
                       "and QReCC sections (see src/utils.py:"
                       "build_qwen_instruct_query_ids).")
@@ -48,8 +49,9 @@ TEMPLATE_VERSION = _args.template_version
 # "Instruct: {task}\nQuery:{q}" (BEIR) or with the conversational template
 # (TopiOCQA / QReCC). Documents are encoded WITHOUT instruction.
 # See Qwen3-Embedding tech report arXiv:2506.05176.
-TOPIOCQA_CONV_INSTRUCTION = (CONV_INSTRUCTION_V1
-                             if TEMPLATE_VERSION == "v1" else CONV_INSTRUCTION_V2)
+TOPIOCQA_CONV_INSTRUCTION = {"v1": CONV_INSTRUCTION_V1,
+                             "v2": CONV_INSTRUCTION_V2,
+                             "v3": CONV_INSTRUCTION_V3}[TEMPLATE_VERSION]
 QRECC_CONV_INSTRUCTION = TOPIOCQA_CONV_INSTRUCTION
 import numpy as np
 import faiss
@@ -194,13 +196,15 @@ with open(TOPIOCQA_VALID, encoding="utf-8") as f:
         ctx_utts = list(rec.get("Context", []))
         cur_utt  = rec["Question"]
         topi_qids.append(qid)
-        if TEMPLATE_VERSION == "v2":
-            # role-marker template (mirrors utils.build_qwen_instruct_query_ids' non-smart path)
+        if TEMPLATE_VERSION in ("v2", "v3"):
+            # role-marker template (mirrors utils.build_qwen_instruct_query_ids' non-smart path).
+            # v3 only differs from v2 on the marker for the trailing user utterance.
             seg = []
             for j, utt in enumerate(ctx_utts):
                 role = "User" if (j % 2 == 0) else "System"
                 seg.append(f"{role}: {utt}")
-            seg.append(f"User: {cur_utt}")
+            cur_role = "User's last question" if TEMPLATE_VERSION == "v3" else "User"
+            seg.append(f"{cur_role}: {cur_utt}")
             conversation = " ".join(seg)
             topi_texts.append(
                 f"Instruct: {TOPIOCQA_CONV_INSTRUCTION}\nConversation: {conversation}"
@@ -288,12 +292,13 @@ with open(QRECC_VALID, encoding="utf-8") as f:
         ctx_utts = list(rec.get("Context", []))
         cur_utt  = rec["Question"]
         qrecc_qids.append(qid)
-        if TEMPLATE_VERSION == "v2":
+        if TEMPLATE_VERSION in ("v2", "v3"):
             seg = []
             for j, utt in enumerate(ctx_utts):
                 role = "User" if (j % 2 == 0) else "System"
                 seg.append(f"{role}: {utt}")
-            seg.append(f"User: {cur_utt}")
+            cur_role = "User's last question" if TEMPLATE_VERSION == "v3" else "User"
+            seg.append(f"{cur_role}: {cur_utt}")
             conversation = " ".join(seg)
             qrecc_texts.append(
                 f"Instruct: {QRECC_CONV_INSTRUCTION}\nConversation: {conversation}"

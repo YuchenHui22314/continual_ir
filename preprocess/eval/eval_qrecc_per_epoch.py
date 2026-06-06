@@ -76,7 +76,7 @@ def discover_ckpt_steps(run_name):
 
 # Conversational-instruction strings live in utils; we import both so the
 # --template_version CLI flag can swap between them without duplicating text.
-from utils import CONV_INSTRUCTION_V1, CONV_INSTRUCTION_V2
+from utils import CONV_INSTRUCTION_V1, CONV_INSTRUCTION_V2, CONV_INSTRUCTION_V3
 CONV_INSTRUCTION = CONV_INSTRUCTION_V1   # legacy alias for the doc-string above
 
 
@@ -461,7 +461,9 @@ def setting_spec(setting, device, template_version="v1"):
             base.config.use_cache = False
             return tok, QwenQueryEncoder(base)
         # Pick the conv-instruction string that matches the requested template.
-        conv_instr = CONV_INSTRUCTION_V2 if template_version == "v2" else CONV_INSTRUCTION_V1
+        conv_instr = {"v1": CONV_INSTRUCTION_V1,
+                      "v2": CONV_INSTRUCTION_V2,
+                      "v3": CONV_INSTRUCTION_V3}[template_version]
         return dict(
             corpus_dir       = QRECC_QWEN_EMB,
             embed_dim        = 1024,
@@ -529,7 +531,7 @@ def main():
     # v2 = new role-marker template (added 2026-06-05). v1-trained checkpoints
     # are OOD under v2, so v2 is most informative on zero-shot Qwen3-base.
     ap.add_argument("--template_version", type=str, default="v1",
-                    choices=["v1", "v2"],
+                    choices=["v1", "v2", "v3"],
                     help="Conversational instruct template version "
                          "(see src/utils.py:build_qwen_instruct_query_ids).")
     # Dry-run: build raw-conv jsonl, print one sample encoder input, then exit
