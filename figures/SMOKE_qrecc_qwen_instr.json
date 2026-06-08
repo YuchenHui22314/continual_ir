@@ -1,0 +1,29 @@
+{
+  "zero_shot": {
+    "0": 0.04788
+  },
+  "instruct2_qwen_nosched": {
+    "1880": 0.03085
+  },
+  "instruct2_qwen_cl_step": {
+    "1880": 0.03078
+  },
+  "instruct2_qwen_cl_step_excl": {
+    "1880": 0.02896
+  },
+  "instruct2_qwen_cl_step_excl_2_full": {
+    "1880": 0.03056
+  },
+  "instruct2_qwen_cl_root2": {
+    "1880": 0.03108
+  },
+  "instruct2_qwen_acl_root2": {
+    "1880": 0.03101
+  },
+  "instruct2_qwen_acl_step": {
+    "1880": 0.03075
+  },
+  "instruct2_qwen_acl_step_excl": {
+    "1880": 0.03139
+  }
+}
