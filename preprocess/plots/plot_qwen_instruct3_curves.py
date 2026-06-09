@@ -7,22 +7,28 @@ single-panel curves matching Figure 4 (a)(b)/(c)(d) style:
   - training_curves_qwen_instruct3.png         (TopiOCQA NDCG@10 per epoch)
   - training_curves_msmarco_qwen_instruct3.png (MSMARCO NDCG@10 per epoch)
 
-Data sources:
-  - TopiOCQA per-epoch NDCG@10: parsed from each run's training log
-    (`topiocqa eval: NDCG@10=` lines, same lowercase pattern as instruct2 logs).
-    These are valid: the in-training TopiOCQA eval builds queries with
-    build_qwen_instruct_query_ids, byte-identical to the training format.
+Data sources — BOTH metrics come from offline per-epoch JSONs; NEITHER
+in-training log series is usable for the instruct3 batch:
+  - TopiOCQA per-epoch NDCG@10: read from
+    `figures/instruct3_qwen_topiocqa_per_epoch.json`, produced offline by
+    eval_instruct3_qwen_topiocqa_per_epoch.py under the proper v3 template.
+    The in-training TopiOCQA eval calls in train_qwen_cl.py (as of the
+    instruct3 batch) did not pass template_version, so eval_conv_search fell
+    back to "v1": v3-trained models were evaluated on v1-format queries all
+    through training, depressing every reading by ~7 NDCG@10 points
+    (in-training final 0.3940 vs offline-v3 0.4669 on the same
+    instruct3_nosched ckpt, 2026-06-09).
   - MSMARCO per-epoch NDCG@10: read from
     `figures/instruct3_qwen_msmarco_per_epoch.json`, produced offline by
     eval_instruct3_qwen_msmarco_per_epoch.py (raw tokenizer + per-task
     instruction map). The in-training MSMARCO log values are NOT usable:
-    train_qwen_cl.py passes the Qwen3TokenizerWrapper to eval_beir_from_cache,
+    train_qwen_cl.py passed the Qwen3TokenizerWrapper to eval_beir_from_cache,
     which brackets each BEIR query with <|im_end|> instead of the official
     trailing <|endoftext|>, shifting the last-token pool onto a position the
     instruct-template models never train. Smoke 2026-06-09 (same ckpt, same
     instruction map): wrapper=0.1586 == training log, raw=0.3363 == offline.
-    (An earlier revision of this script parsed the training logs and produced
-    a bogus 0.14-0.18 trajectory band for panel (h).)
+    (Earlier revisions of this script parsed the training logs and produced
+    bogus trajectories for both panels.)
 """
 
 import json
@@ -52,53 +58,35 @@ RUN_LOGS = {
 }
 
 # ---------------------------------------------------------------------------
-# 2.  Parsers — TopiOCQA from the in-training log lines, MSMARCO from the
-#     offline per-epoch JSON (see module docstring for why the in-training
-#     MSMARCO log values are unusable).
+# 2.  Loaders — BOTH metrics come from the offline per-epoch JSONs (see module
+#     docstring for why neither in-training log series is usable).
 # ---------------------------------------------------------------------------
-# In-training eval line format:
-#   2026-06-06 01:09:12,733 - utils - INFO - topiocqa eval: NDCG@10=0.3773  Recall@100=...
-TOPIOCQA_PAT = re.compile(
-    r"topiocqa eval: NDCG@10=([0-9.]+)\s+Recall@100=([0-9.]+)\s+MRR@10=([0-9.]+)"
-)
+FIG_DIR = "/data/rech/huiyuche/continual_ir/figures"
+TOPIOCQA_JSON_PATH = f"{FIG_DIR}/instruct3_qwen_topiocqa_per_epoch.json"
+MSMARCO_JSON_PATH  = f"{FIG_DIR}/instruct3_qwen_msmarco_per_epoch.json"
 
-
-def parse_topiocqa_log(path):
-    """Return list of per-epoch TopiOCQA NDCG@10 floats (in training order)."""
-    ndcg = []
-    try:
-        with open(path, "r", errors="replace") as f:
-            for line in f:
-                m = TOPIOCQA_PAT.search(line)
-                if m:
-                    ndcg.append(float(m.group(1)))
-    except FileNotFoundError:
-        print(f"  [WARNING] File not found: {path}")
-    return ndcg
-
-
-# Offline-corrected MSMARCO JSON: {run_name: {step_str: ndcg}}
-MSMARCO_JSON_PATH = "/data/rech/huiyuche/continual_ir/figures/instruct3_qwen_msmarco_per_epoch.json"
+with open(TOPIOCQA_JSON_PATH) as f:
+    TOPIOCQA_JSON = json.load(f)
 with open(MSMARCO_JSON_PATH) as f:
     MSMARCO_JSON = json.load(f)
 
 
-def get_msmarco(run_name):
-    """Return list of per-epoch MSMARCO NDCG@10 floats (sorted by step)."""
-    d = MSMARCO_JSON.get(run_name, {})
+def get_series(json_dict, run_name, metric_label):
+    """Return list of per-epoch NDCG@10 floats (sorted by ckpt step)."""
+    d = json_dict.get(run_name, {})
     if not d:
-        print(f"  [WARNING] no MSMARCO entries for {run_name}")
+        print(f"  [WARNING] no {metric_label} entries for {run_name}")
         return []
     steps = sorted(int(k) for k in d.keys())
     return [d[str(s)] for s in steps]
 
 
-print("Parsing logs / loading JSON …")
+print("Loading offline per-epoch JSONs …")
 all_data = {}
-for run_name, log_path in RUN_LOGS.items():
+for run_name in RUN_LOGS:
     d = {
-        "topiocqa_ndcg10": parse_topiocqa_log(log_path),
-        "msmarco_ndcg10":  get_msmarco(run_name),
+        "topiocqa_ndcg10": get_series(TOPIOCQA_JSON, run_name, "TopiOCQA"),
+        "msmarco_ndcg10":  get_series(MSMARCO_JSON,  run_name, "MSMARCO"),
     }
     all_data[run_name] = d
     print(f"  {run_name}: {len(d['topiocqa_ndcg10'])} TopiOCQA epochs, "

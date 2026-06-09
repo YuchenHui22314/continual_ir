@@ -581,6 +581,14 @@ def train(args):
                         left_padding = True,
                         dataset_tag = "topiocqa",
                         conv_instruction = args.conv_instruction,
+                        # MUST match the training-side template (data.py reads
+                        # args.template_version). Omitting this left eval on the
+                        # "v1" default while instruct3 trained on v3 — a train/eval
+                        # format mismatch that depressed every in-training TopiOCQA
+                        # reading by ~7 NDCG@10 points (in-training 0.3940 vs
+                        # offline 0.4669 on the same instruct3_nosched final ckpt,
+                        # 2026-06-09).
+                        template_version = args.template_version,
                     )
                 if args.save_to_wandb:
                     if is_last_epoch:
@@ -611,6 +619,9 @@ def train(args):
                         left_padding = True,
                         dataset_tag = "qrecc",
                         conv_instruction = args.conv_instruction,
+                        # Same train/eval template alignment as the TopiOCQA call
+                        # above — see the comment there.
+                        template_version = args.template_version,
                     )
                 if args.save_to_wandb:
                     if is_last_epoch:
