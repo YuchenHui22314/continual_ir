@@ -536,13 +536,21 @@ def train(args):
                     # together overflow 46 GB; loading one at a time peaks at ~40 GB.
                     # Pass the per-task Qwen3 BEIR instruction map so MSMARCO and
                     # BEIR datasets are evaluated the same way as the zero-shot
-                    # baseline (apples-to-apples). Without this, in-training MSMARCO
-                    # NDCG@10 looked catastrophically low (~0.13) because the eval
-                    # encoded queries WITHOUT any instruction; with this map enabled
-                    # the post-training eval recovers to ~0.33.
+                    # baseline (apples-to-apples).
+                    # BEIR queries must use the RAW tokenizer, NOT the
+                    # Qwen3TokenizerWrapper: the raw tokenizer's post-processor
+                    # appends the official trailing <|endoftext|> (151643) that the
+                    # BEIR corpus embeddings were built with, whereas the wrapper
+                    # brackets the query with <|im_end|> (151645) boundary tokens and
+                    # shifts the last-token pool onto a position the instruct-template
+                    # models never train. Smoke 2026-06-09 (instruct3_qwen_nosched
+                    # step-1880, same instruction map): wrapper=0.1586 vs raw=0.3363.
+                    # This wrapper artifact (not the instruction map alone) is what
+                    # made instruct2/instruct3 in-training MSMARCO read ~0.13-0.17;
+                    # the map fix (ca2b960) only accounted for 0.13->0.16.
                     metric_numbers = eval_beir_from_cache(
                         beir_cache = beir_eval_cache, query_encoder = query_encoder,
-                        tokenizer = query_tokenizer, device = args.device,
+                        tokenizer = raw_tokenizer, device = args.device,
                         eval_batch_size = args.eval_batch_size,
                         use_gpu_faiss = args.use_gpu_faiss, keep_faiss_on_gpu = False,
                         gpu_index_cache = _gpu_faiss_cache, full_eval = is_last_epoch,

@@ -10,14 +10,22 @@ single-panel curves matching Figure 4 (a)(b)/(c)(d) style:
 Data sources:
   - TopiOCQA per-epoch NDCG@10: parsed from each run's training log
     (`topiocqa eval: NDCG@10=` lines, same lowercase pattern as instruct2 logs).
-  - MSMARCO per-epoch NDCG@10: ALSO parsed directly from each run's training
-    log. Unlike instruct2 (whose in-training MSMARCO eval missed the per-task
-    instruction map and collapsed to ~0.13, hence the offline JSON workaround
-    in plot_qwen_instruct_curves.py), instruct3 was trained AFTER commit
-    ca2b960 fixed the per-task instruction map, so the in-training MSMARCO
-    values are trustworthy and no separate JSON is needed.
+    These are valid: the in-training TopiOCQA eval builds queries with
+    build_qwen_instruct_query_ids, byte-identical to the training format.
+  - MSMARCO per-epoch NDCG@10: read from
+    `figures/instruct3_qwen_msmarco_per_epoch.json`, produced offline by
+    eval_instruct3_qwen_msmarco_per_epoch.py (raw tokenizer + per-task
+    instruction map). The in-training MSMARCO log values are NOT usable:
+    train_qwen_cl.py passes the Qwen3TokenizerWrapper to eval_beir_from_cache,
+    which brackets each BEIR query with <|im_end|> instead of the official
+    trailing <|endoftext|>, shifting the last-token pool onto a position the
+    instruct-template models never train. Smoke 2026-06-09 (same ckpt, same
+    instruction map): wrapper=0.1586 == training log, raw=0.3363 == offline.
+    (An earlier revision of this script parsed the training logs and produced
+    a bogus 0.14-0.18 trajectory band for panel (h).)
 """
 
+import json
 import re
 import matplotlib
 matplotlib.use("Agg")
@@ -44,41 +52,54 @@ RUN_LOGS = {
 }
 
 # ---------------------------------------------------------------------------
-# 2.  Parsers — pull both metrics from the in-training log lines.
+# 2.  Parsers — TopiOCQA from the in-training log lines, MSMARCO from the
+#     offline per-epoch JSON (see module docstring for why the in-training
+#     MSMARCO log values are unusable).
 # ---------------------------------------------------------------------------
-# In-training eval line formats:
-#   2026-06-06 01:08:45,945 - utils - INFO -   eval_beir_from_cache msmarco: NDCG@10 = 0.1869
+# In-training eval line format:
 #   2026-06-06 01:09:12,733 - utils - INFO - topiocqa eval: NDCG@10=0.3773  Recall@100=...
 TOPIOCQA_PAT = re.compile(
     r"topiocqa eval: NDCG@10=([0-9.]+)\s+Recall@100=([0-9.]+)\s+MRR@10=([0-9.]+)"
 )
-MSMARCO_PAT = re.compile(
-    r"eval_beir_from_cache msmarco: NDCG@10 = ([0-9.]+)"
-)
 
 
-def parse_log(path):
-    """Return {'topiocqa_ndcg10': [...], 'msmarco_ndcg10': [...]} from a log."""
-    data = {"topiocqa_ndcg10": [], "msmarco_ndcg10": []}
+def parse_topiocqa_log(path):
+    """Return list of per-epoch TopiOCQA NDCG@10 floats (in training order)."""
+    ndcg = []
     try:
         with open(path, "r", errors="replace") as f:
             for line in f:
                 m = TOPIOCQA_PAT.search(line)
                 if m:
-                    data["topiocqa_ndcg10"].append(float(m.group(1)))
-                    continue
-                m = MSMARCO_PAT.search(line)
-                if m and "full eval" not in line:
-                    data["msmarco_ndcg10"].append(float(m.group(1)))
+                    ndcg.append(float(m.group(1)))
     except FileNotFoundError:
         print(f"  [WARNING] File not found: {path}")
-    return data
+    return ndcg
 
 
-print("Parsing logs …")
+# Offline-corrected MSMARCO JSON: {run_name: {step_str: ndcg}}
+MSMARCO_JSON_PATH = "/data/rech/huiyuche/continual_ir/figures/instruct3_qwen_msmarco_per_epoch.json"
+with open(MSMARCO_JSON_PATH) as f:
+    MSMARCO_JSON = json.load(f)
+
+
+def get_msmarco(run_name):
+    """Return list of per-epoch MSMARCO NDCG@10 floats (sorted by step)."""
+    d = MSMARCO_JSON.get(run_name, {})
+    if not d:
+        print(f"  [WARNING] no MSMARCO entries for {run_name}")
+        return []
+    steps = sorted(int(k) for k in d.keys())
+    return [d[str(s)] for s in steps]
+
+
+print("Parsing logs / loading JSON …")
 all_data = {}
 for run_name, log_path in RUN_LOGS.items():
-    d = parse_log(log_path)
+    d = {
+        "topiocqa_ndcg10": parse_topiocqa_log(log_path),
+        "msmarco_ndcg10":  get_msmarco(run_name),
+    }
     all_data[run_name] = d
     print(f"  {run_name}: {len(d['topiocqa_ndcg10'])} TopiOCQA epochs, "
           f"{len(d['msmarco_ndcg10'])} MSMARCO epochs")
