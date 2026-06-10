@@ -182,18 +182,39 @@ def make_figure(metric_key, ylabel, out_path, y_offsets=None,
 # 6.  Generate the two panels (TopiOCQA + MSMARCO)
 # ---------------------------------------------------------------------------
 print("\nGenerating training_curves_qwen_instruct3.png …")
+# Final TopiOCQA values cluster tightly (Baseline 46.73, CL-step-excl-full
+# 46.71, CL-step 46.15, CL-step-excl 45.87) — fan the labels out vertically.
 make_figure(
     metric_key="topiocqa_ndcg10",
     ylabel="NDCG@10",
     out_path="/data/rech/huiyuche/continual_ir/figures/training_curves_qwen_instruct3.png",
+    y_offsets={
+        ("instruct3_qwen_nosched",             "topiocqa_ndcg10"): (0.4,  0.0077),
+        ("instruct3_qwen_cl_step_excl_2_full", "topiocqa_ndcg10"): (0.4,  0.0000),
+        ("instruct3_qwen_cl_step",             "topiocqa_ndcg10"): (0.4, -0.0025),
+        ("instruct3_qwen_cl_step_excl",        "topiocqa_ndcg10"): (0.4, -0.0077),
+        ("instruct3_qwen_acl_step",            "topiocqa_ndcg10"): (0.4,  0.0028),
+        ("instruct3_qwen_acl_step_excl",       "topiocqa_ndcg10"): (0.4,  0.0000),
+    },
     label_x_pad=0.4,
 )
 
 print("Generating training_curves_msmarco_qwen_instruct3.png …")
+# Final MSMARCO values: ACL-step 34.47, ACL-step-excl 34.03, CL-step-excl
+# 33.80, CL-step 33.67, Baseline 33.63, CL-step-excl-full 33.54 — the bottom
+# four are within 0.26 pt of each other; stagger them.
 make_figure(
     metric_key="msmarco_ndcg10",
     ylabel="NDCG@10",
     out_path="/data/rech/huiyuche/continual_ir/figures/training_curves_msmarco_qwen_instruct3.png",
+    y_offsets={
+        ("instruct3_qwen_acl_step",            "msmarco_ndcg10"): (0.4,  0.0010),
+        ("instruct3_qwen_acl_step_excl",       "msmarco_ndcg10"): (0.4,  0.0000),
+        ("instruct3_qwen_cl_step_excl",        "msmarco_ndcg10"): (0.4,  0.0005),
+        ("instruct3_qwen_cl_step",             "msmarco_ndcg10"): (0.4,  0.0003),
+        ("instruct3_qwen_nosched",             "msmarco_ndcg10"): (0.4, -0.0011),
+        ("instruct3_qwen_cl_step_excl_2_full", "msmarco_ndcg10"): (0.4, -0.0014),
+    },
     label_x_pad=0.4,
 )
 
