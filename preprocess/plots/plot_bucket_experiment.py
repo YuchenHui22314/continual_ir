@@ -132,4 +132,94 @@ try:
 except FileNotFoundError:
     print("EWC json not found yet — skipping fisher overlap plot")
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Second-generation figures (one-message-per-figure versions; the originals
+# above are kept for the appendix).
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── 5. dose-response: MSMARCO drop vs training-conversation length ───────────
+x = np.arange(len(BUCKETS))
+drop470 = [(ZS["msmarco"] - D[f"bucket_qwen_{b}"]["470"]["msmarco"]) * 100 for b in BUCKETS]
+drop47  = [(ZS["msmarco"] - D[f"bucket_qwen_{b}"]["47"]["msmarco"]) * 100 for b in BUCKETS]
+fig, ax = plt.subplots(figsize=(8.5, 5))
+ax.plot(x, drop470, "o-",  color="#b02050", lw=2.2, ms=7, label="after 470 steps")
+ax.plot(x, drop47,  "s--", color="#e58aa8", lw=1.8, ms=6, label="after 47 steps")
+ax.set_xticks(x, LABELS)
+ax.set_xlabel("training-conversation length (bucket)")
+ax.set_ylabel("MS MARCO NDCG@10 drop (×100)")
+ax.set_ylim(bottom=0)
+ax.legend(frameon=False)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/bucket_dose_response.png", bbox_inches="tight")
+plt.close(fig)
+print("saved bucket_dose_response.png")
+
+# ── 6. mechanism scatter: Fisher overlap vs measured forgetting ──────────────
+try:
+    with open(EWC_JSON) as f:
+        ewc = json.load(f)
+    ov = [ewc["fisher_overlap_vs_bucket"][b]["0.01"] for b in BUCKETS]
+    fig, ax = plt.subplots(figsize=(7.5, 5.5))
+    sc = ax.scatter(ov, drop470, c=np.arange(len(BUCKETS)), cmap="plasma",
+                    s=80, zorder=3)
+    for i, b in enumerate(LABELS):
+        ax.annotate(b, (ov[i], drop470[i]), xytext=(6, 5),
+                    textcoords="offset points", fontsize=10)
+    ax.set_xlabel("Fisher-mask overlap with MS MARCO (top-1%, base encoder)")
+    ax.set_ylabel("MS MARCO NDCG@10 drop after 470 steps (×100)")
+    cb = fig.colorbar(sc, ax=ax, ticks=[0, len(BUCKETS) - 1])
+    cb.ax.set_yticklabels(["short", "long"])
+    cb.set_label("conversation length")
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/bucket_overlap_vs_drop.png", bbox_inches="tight")
+    plt.close(fig)
+    print("saved bucket_overlap_vs_drop.png")
+except FileNotFoundError:
+    print("EWC json missing — skipped overlap-vs-drop scatter")
+
+# ── 7. Δ-heatmap: transfer matrix RELATIVE TO ZERO-SHOT ──────────────────────
+# Cell (i, j) = NDCG(train bucket i, eval turn j) − zero-shot(eval turn j):
+# blue = trained model HELPS that eval length, red = HURTS it. Removes the
+# per-column baseline difficulty that dominates the absolute heatmap.
+Md = (M[1:, :] - M[0:1, :]) * 100
+vmax = np.abs(Md).max()
+fig, ax = plt.subplots(figsize=(10.5, 8.5))
+im = ax.imshow(Md, cmap="RdBu", vmin=-vmax, vmax=vmax, aspect="auto")
+ax.set_xticks(range(len(LABELS)), LABELS)
+ax.set_yticks(range(len(LABELS)), LABELS)
+ax.set_xlabel("eval turn length")
+ax.set_ylabel("training bucket (conversation length)")
+for i in range(Md.shape[0]):
+    for j in range(Md.shape[1]):
+        ax.text(j, i, f"{Md[i, j]:+.0f}", ha="center", va="center",
+                color="black", fontsize=9)
+for k in range(len(BUCKETS)):
+    ax.add_patch(plt.Rectangle((k - 0.5, k - 0.5), 1, 1, fill=False,
+                               edgecolor="black", lw=1.6))
+ax.set_title("Δ TopiOCQA NDCG@10 vs zero-shot (×100) after 470 single-bucket steps")
+fig.colorbar(im, ax=ax, shrink=0.8, label="Δ NDCG@10 (×100)")
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/bucket_transfer_delta.png", bbox_inches="tight")
+plt.close(fig)
+print("saved bucket_transfer_delta.png")
+
+# ── 8. generalization profiles: Δ vs eval length, representative buckets ─────
+REPS = ["turn_1", "turn_3", "turn_5", "turn_10", "turn_15plus"]
+REP_COLORS = {"turn_1": "#b02050", "turn_3": "#e8a13a", "turn_5": "#4caf73",
+              "turn_10": "#0097a7", "turn_15plus": "#5e35b1"}
+fig, ax = plt.subplots(figsize=(9, 5.2))
+for b in REPS:
+    i = BUCKETS.index(b)
+    ax.plot(range(len(LABELS)), Md[i, :], "o-", lw=2,
+            color=REP_COLORS[b], label=f"train {LABELS[i]}")
+ax.axhline(0, color="gray", lw=1, ls=":")
+ax.set_xticks(range(len(LABELS)), LABELS)
+ax.set_xlabel("eval turn length")
+ax.set_ylabel("Δ NDCG@10 vs zero-shot (×100)")
+ax.legend(frameon=False, title="training bucket", fontsize=10)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/bucket_generalization_profiles.png", bbox_inches="tight")
+plt.close(fig)
+print("saved bucket_generalization_profiles.png")
+
 print("Done.")
