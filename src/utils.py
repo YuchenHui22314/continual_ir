@@ -959,6 +959,7 @@ def eval_conv_search(
     conv_instruction:    str  = "",
     use_gpu_fp16:        bool = False,
     template_version:    str  = "v1",
+    report_qid_subsets:  dict = None,
 ) -> dict:
     """
     Per-epoch conversational search evaluation using a pre-loaded in-memory FAISS index.
@@ -1085,9 +1086,24 @@ def eval_conv_search(
             if 0 <= int(idx) < len(doc_ids)
         }
 
+    def _metrics_for(qrels_sub, run_sub):
+        """Compute the metric dict for one (qrels, run) pair — same branches
+        as the historical inline code so the no-subset path is bit-identical."""
+        if full_eval:
+            m = _compute_full_metrics(qrels_sub, run_sub)
+        else:
+            retriever = EvaluateRetrieval(None)
+            ndcg, _map, recall, _ = retriever.evaluate(qrels_sub, run_sub, [10, top_k])
+            mrr = retriever.evaluate_custom(qrels_sub, run_sub, [10], metric="mrr")
+            m = {
+                "NDCG@10":         ndcg["NDCG@10"],
+                f"Recall@{top_k}": recall[f"Recall@{top_k}"],
+                "MRR@10":          mrr["MRR@10"],
+            }
+        return m
+
+    metrics = _metrics_for(qrels, run)
     if full_eval:
-        # Full metric suite for final-epoch summary logging
-        metrics = _compute_full_metrics(qrels, run)
         logger.info(
             f"{dataset_tag} full eval: NDCG@10={metrics['NDCG@10']:.4f}  "
             f"Recall@100={metrics['Recall@100']:.4f}  "
@@ -1095,18 +1111,32 @@ def eval_conv_search(
             f"MAP@10={metrics['MAP@10']:.4f}"
         )
     else:
-        # Lightweight per-epoch eval: NDCG@10, Recall@top_k, MRR@10
-        retriever = EvaluateRetrieval(None)
-        ndcg, _map, recall, _ = retriever.evaluate(qrels, run, [10, top_k])
-        mrr = retriever.evaluate_custom(qrels, run, [10], metric="mrr")
-        metrics = {
-            "NDCG@10":           ndcg["NDCG@10"],
-            f"Recall@{top_k}":   recall[f"Recall@{top_k}"],
-            "MRR@10":            mrr["MRR@10"],
-        }
         logger.info(f"{dataset_tag} eval: NDCG@10={metrics['NDCG@10']:.4f}  "
                     f"Recall@{top_k}={metrics[f'Recall@{top_k}']:.4f}  "
                     f"MRR@10={metrics['MRR@10']:.4f}")
+
+    # Optional per-subset metrics (e.g. per-turn-length groups for the
+    # turn-bucket experiment). The expensive encode+search above is done ONCE;
+    # each named subset only re-runs the cheap metric computation on the
+    # filtered (qrels, run) pair. Returns a nested dict; callers that do not
+    # pass report_qid_subsets get the historical flat dict unchanged.
+    if report_qid_subsets:
+        nested = {"__full__": metrics}
+        for subset_name, subset_qids in report_qid_subsets.items():
+            qrels_sub = {q: rels for q, rels in qrels.items() if q in subset_qids}
+            run_sub   = {q: docs for q, docs in run.items()   if q in subset_qids}
+            if not qrels_sub or not run_sub:
+                logger.warning(f"{dataset_tag} subset '{subset_name}': no overlapping "
+                               f"qids — skipped.")
+                continue
+            m_sub = _metrics_for(qrels_sub, run_sub)
+            m_sub["n_queries"] = len(run_sub)
+            nested[subset_name] = m_sub
+            logger.info(f"{dataset_tag} subset {subset_name} ({len(run_sub)} q): "
+                        f"NDCG@10={m_sub['NDCG@10']:.4f}")
+        encoder.train()
+        return nested
+
     encoder.train()
     return metrics
 

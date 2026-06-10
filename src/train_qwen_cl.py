@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 import sys, argparse, contextlib, time, os, gc
 from os.path import join as oj
+import numpy as np
 
 sys.path.append('..')
 sys.path.append('.')
@@ -186,7 +187,12 @@ def cal_kd_loss(query_embs, oracle_query_embs):
 
 
 def save_model(args, model_output_path, model, query_tokenizer, optimizer, scheduler,
-               cur_step, cur_epoch, best_loss):
+               cur_step, cur_epoch, best_loss, save_optimizer=True):
+    # save_optimizer=False is used by the step-driven turn-bucket runs for the
+    # intermediate (every --save_every_steps) checkpoints: the 2.4 GB AdamW
+    # state is only needed at the final checkpoint, and Delta-theta analysis
+    # only needs the model weights. Default True keeps the historical behavior
+    # of the epoch-mode runs.
     output_dir = oj(model_output_path, f"checkpoint-step-{cur_step}")
     if os.path.exists(output_dir):
         logger.info(f"Checkpoint {output_dir} already exists, skipping save.")
@@ -195,8 +201,9 @@ def save_model(args, model_output_path, model, query_tokenizer, optimizer, sched
     model_to_save = model.module if hasattr(model, "module") else model
     model_to_save.save_pretrained(output_dir)           # saves inner Qwen3 AutoModel
     query_tokenizer.save_pretrained(output_dir)         # saves Qwen2Tokenizer files
-    torch.save(optimizer.state_dict(), oj(output_dir, "optimizer.pt"))
-    torch.save(scheduler.state_dict(), oj(output_dir, "scheduler.pt"))
+    if save_optimizer:
+        torch.save(optimizer.state_dict(), oj(output_dir, "optimizer.pt"))
+        torch.save(scheduler.state_dict(), oj(output_dir, "scheduler.pt"))
     torch.save({"step": cur_step, "epoch": cur_epoch, "best_loss": best_loss},
                oj(output_dir, "trainer_state.pt"))
     logger.info(f"Saved checkpoint at {output_dir}")
@@ -277,6 +284,28 @@ def train(args):
 
     if steps_per_epoch == 0:
         raise ValueError(f"steps_per_epoch=0: dataset too small or gradient_accumulation_steps too large.")
+
+    # ── Step-driven mode (--total_train_steps > 0) — used by the turn-bucket
+    # runs, whose datasets (~3k samples ≈ 6 steps/pass at batch 480) are far
+    # smaller than one conventional epoch. We repurpose the existing epoch
+    # loop: one "epoch" = --save_every_steps optimizer steps drawn from a
+    # cycling iterator over the full (small) dataset, so the end-of-epoch
+    # save_model() call produces a checkpoint every --save_every_steps steps
+    # (checkpoint-step-{47, 94, ..., 470} with the defaults).
+    if args.total_train_steps > 0:
+        if args.curriculum_type != "none":
+            raise ValueError("--total_train_steps only supports --curriculum_type none "
+                             "(the turn-bucket runs are single-difficulty by construction).")
+        steps_per_epoch       = args.save_every_steps
+        micro_steps_per_epoch = steps_per_epoch * args.gradient_accumulation_steps
+        args.num_train_epochs = (args.total_train_steps + args.save_every_steps - 1) \
+                                // args.save_every_steps
+        total_training_steps  = args.num_train_epochs * steps_per_epoch
+        if is_main_process:
+            logger.info(f"Step-driven mode: {total_training_steps} optimizer steps total, "
+                        f"checkpoint every {steps_per_epoch} steps "
+                        f"({args.num_train_epochs} save points), cycling over "
+                        f"{len(train_dataset)} samples.")
 
     if is_main_process and args.curriculum_type != "none":
         log_pacing_schedule(args.num_train_epochs, steps_per_epoch, curriculum_steps,
@@ -399,6 +428,33 @@ def train(args):
                 f"{args.num_train_epochs} epochs, {total_training_steps} steps total.")
     args.log_print_steps = max(1, int(args.log_print_ratio * steps_per_epoch))
 
+    # ── Gradient-statistics recorder (--record_grad_stats) ───────────────────
+    # R1: per-step per-tensor L2 grad norms (~310 floats/step, negligible).
+    # R2: whole-run per-scalar signed gradient sum (sum_g) and sum of squares
+    #     (sum_g2), fp32 accumulators. sum_g captures the NET update direction,
+    #     sum_g2 the total gradient energy (diagonal-Fisher proxy, cf. Sung et
+    #     al. 2021 FISH mask); |sum_g|/sqrt(T*sum_g2) in [0,1] measures sign
+    #     coherence (1 = consistently same-direction drift, ~0 = oscillating /
+    #     cancelling updates — cf. the ~8% cancelled-out parameters reported in
+    #     arXiv 2505.11711 Fig. 2). Grads are recorded AFTER clip_grad_norm_,
+    #     i.e. the effective signal that reaches the optimizer. Under DDP the
+    #     post-all-reduce grads are identical on every rank, so rank 0 records.
+    grad_stats = None
+    _model_for_stats = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
+    if args.record_grad_stats and is_main_process:
+        _gs_device = args.device if args.grad_stats_device == "gpu" else torch.device("cpu")
+        grad_stats = {
+            "names":  [n for n, p in _model_for_stats.named_parameters() if p.requires_grad],
+            "per_step_norms": [],
+            "sum_g":  {n: torch.zeros(p.shape, dtype=torch.float32, device=_gs_device)
+                       for n, p in _model_for_stats.named_parameters() if p.requires_grad},
+            "sum_g2": {n: torch.zeros(p.shape, dtype=torch.float32, device=_gs_device)
+                       for n, p in _model_for_stats.named_parameters() if p.requires_grad},
+            "n_steps": 0,
+        }
+        logger.info(f"record_grad_stats ON: {len(grad_stats['names'])} parameter tensors, "
+                    f"accumulators on {_gs_device}.")
+
     epoch_iterator = trange(start_epoch, args.num_train_epochs, desc="Epoch")
 
     for epoch in epoch_iterator:
@@ -444,7 +500,10 @@ def train(args):
         else:
             current_loader = train_loader
 
-        if args.curriculum_type != "none":
+        if args.curriculum_type != "none" or args.total_train_steps > 0:
+            # Curriculum subsets AND step-driven (turn-bucket) runs both need
+            # the cycling iterator: the active dataset is smaller than the
+            # number of micro-steps the "epoch" must yield.
             batch_iter = make_cycling_iter(current_loader, micro_steps_per_epoch, epoch)
         else:
             if args.n_gpu > 1:
@@ -504,6 +563,25 @@ def train(args):
 
             if is_last_in_accum:
                 grad_norm = torch.nn.utils.clip_grad_norm_(query_encoder.parameters(), args.max_grad_norm)
+
+                if grad_stats is not None:
+                    with torch.no_grad():
+                        # R1: per-tensor grad norms (post-clip).
+                        norms = torch.stack([
+                            p.grad.detach().norm().float()
+                            for _, p in _model_for_stats.named_parameters() if p.requires_grad
+                        ]).cpu()
+                        grad_stats["per_step_norms"].append(norms)
+                        # R2: per-scalar accumulators.
+                        for n, p in _model_for_stats.named_parameters():
+                            if not p.requires_grad:
+                                continue
+                            g = p.grad.detach().to(grad_stats["sum_g"][n].device,
+                                                   dtype=torch.float32)
+                            grad_stats["sum_g"][n].add_(g)
+                            grad_stats["sum_g2"][n].addcmul_(g, g)
+                        grad_stats["n_steps"] += 1
+
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -634,13 +712,48 @@ def train(args):
 
             if best_loss > loss_val:
                 best_loss = loss_val
+            # Step-driven runs save the heavy AdamW state only at the FINAL
+            # checkpoint; intermediate ones are model-only (Delta-theta
+            # analysis needs just the weights).
+            _save_opt = (args.total_train_steps == 0) or is_last_epoch
             save_model(args, args.model_output_path, query_encoder, query_tokenizer,
-                       optimizer, scheduler, cur_step, epoch, best_loss)
+                       optimizer, scheduler, cur_step, epoch, best_loss,
+                       save_optimizer=_save_opt)
             if args.save_to_wandb:
                 wandb.run.summary["best_loss"] = best_loss
 
+            # Milestone dumps of the R2 accumulators (step-driven runs): after
+            # the 1st, middle and last save points (steps 47/235/470 with the
+            # defaults). Stored in bf16 to halve disk (1.19 GB per buffer).
+            if grad_stats is not None and args.total_train_steps > 0:
+                milestone_epochs = {0, max(0, args.num_train_epochs // 2 - 1),
+                                    args.num_train_epochs - 1}
+                if epoch in milestone_epochs:
+                    gs_dir = oj(args.model_output_path, f"grad_stats-step-{cur_step}")
+                    os.makedirs(gs_dir, exist_ok=True)
+                    torch.save({n: t.to(torch.bfloat16).cpu()
+                                for n, t in grad_stats["sum_g"].items()},
+                               oj(gs_dir, "sum_g.pt"))
+                    torch.save({n: t.to(torch.bfloat16).cpu()
+                                for n, t in grad_stats["sum_g2"].items()},
+                               oj(gs_dir, "sum_g2.pt"))
+                    torch.save({"n_steps": grad_stats["n_steps"], "step": cur_step},
+                               oj(gs_dir, "meta.pt"))
+                    logger.info(f"Dumped grad-stat accumulators at {gs_dir} "
+                                f"(n_steps={grad_stats['n_steps']}).")
+
         if args.n_gpu > 1:
             dist.barrier()
+
+    if grad_stats is not None:
+        # R1 dump: (n_steps, n_tensors) matrix of per-step per-tensor grad
+        # norms + the tensor-name list.
+        norms_path = oj(args.model_output_path, "grad_norms_per_step.npz")
+        np.savez(norms_path,
+                 norms=torch.stack(grad_stats["per_step_norms"]).numpy(),
+                 names=np.array(grad_stats["names"]))
+        logger.info(f"Saved per-step grad norms ({grad_stats['n_steps']} steps) "
+                    f"to {norms_path}")
 
     logger.info("Training finished!")
     if args.save_to_wandb:
@@ -727,6 +840,25 @@ def get_args():
     parser.add_argument("--use_compile", action="store_true")
 
     # Eval
+    # ── Step-driven mode + gradient recording (turn-bucket experiment) ──────
+    parser.add_argument("--total_train_steps", type=int, default=0,
+                        help="If >0: train for exactly this many optimizer steps, cycling "
+                             "over the (small) dataset, instead of epoch mode. A checkpoint "
+                             "is saved every --save_every_steps steps. Requires "
+                             "--curriculum_type none.")
+    parser.add_argument("--save_every_steps", type=int, default=47,
+                        help="Checkpoint cadence in step-driven mode (intermediate ckpts "
+                             "are model-only; the final one also stores optimizer state).")
+    parser.add_argument("--record_grad_stats", action="store_true",
+                        help="Record per-step per-tensor grad norms (R1) and whole-run "
+                             "per-scalar sum_g / sum_g2 accumulators (R2); see comments at "
+                             "the recorder init.")
+    parser.add_argument("--grad_stats_device", type=str, default="gpu",
+                        choices=["gpu", "cpu"],
+                        help="Where the two fp32 R2 accumulators (2.4 GB each) live. 'gpu' "
+                             "costs ~4.8 GB VRAM on rank 0 but adds ~10 ms/step; 'cpu' is "
+                             "VRAM-free but adds ~0.5 s/step for the device copy.")
+
     parser.add_argument("--activate_eval_while_training", action="store_true")
     parser.add_argument("--beir_embedding_dir", type=str,
                         default="/data/rech/huiyuche/beir/embeddings/qwen3_emb_0.6B")
