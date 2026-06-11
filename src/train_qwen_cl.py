@@ -566,15 +566,19 @@ def train(args):
 
                 if grad_stats is not None:
                     with torch.no_grad():
-                        # R1: per-tensor grad norms (post-clip).
+                        # R1: per-tensor grad norms (post-clip). Guard against
+                        # requires_grad params that never receive a gradient
+                        # (p.grad is None) so the per-step row keeps a fixed
+                        # length; record 0.0 for them.
                         norms = torch.stack([
-                            p.grad.detach().norm().float()
+                            (p.grad.detach().norm().float().cpu() if p.grad is not None
+                             else torch.zeros((), dtype=torch.float32))
                             for _, p in _model_for_stats.named_parameters() if p.requires_grad
-                        ]).cpu()
+                        ])
                         grad_stats["per_step_norms"].append(norms)
-                        # R2: per-scalar accumulators.
+                        # R2: per-scalar accumulators (skip None-grad params).
                         for n, p in _model_for_stats.named_parameters():
-                            if not p.requires_grad:
+                            if not p.requires_grad or p.grad is None:
                                 continue
                             g = p.grad.detach().to(grad_stats["sum_g"][n].device,
                                                    dtype=torch.float32)
