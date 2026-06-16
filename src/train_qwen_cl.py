@@ -61,13 +61,27 @@ class QwenQueryEncoder(nn.Module):
     matching the interface expected by cal_ranking_loss() and the eval functions.
     """
     def __init__(self, model_path: str, use_flash_attention: bool = False,
-                 use_bf16: bool = False):
+                 use_bf16: bool = False, fp32_master_weights: bool = False):
         super().__init__()
         kwargs = {"trust_remote_code": True}
-        if use_bf16 or use_flash_attention:
-            kwargs["torch_dtype"] = torch.bfloat16
-        if use_flash_attention:
-            kwargs["attn_implementation"] = "flash_attention_2"
+        if fp32_master_weights:
+            # fp32 MASTER WEIGHTS: load the (released bf16) weights upcast to fp32 so
+            # the optimizer keeps fp32 master params + fp32 Adam moments. With
+            # autocast(bf16) around the forward (controlled by --use_bf16), matmuls
+            # still run in bf16, so this reproduces the numerics of the official
+            # DeepSpeed-ZeRO bf16 setup (= HF Trainer bf16=True) WITHOUT pure-bf16's
+            # update-rounding floor: at lr=1e-5 a step is below bf16 ULP for
+            # |theta|>=0.0026 and gets rounded away, so ~90% of weights never move.
+            # FlashAttention-2 requires half-precision weights, so we fall back to
+            # sdpa, which computes the SAME exact softmax(QK^T/sqrt(d))V (different
+            # kernel, numerically equivalent — verified by a forward cos>0.999 check).
+            kwargs["attn_implementation"] = "sdpa"
+            # NB: do NOT set torch_dtype -> model loads in fp32.
+        else:
+            if use_bf16 or use_flash_attention:
+                kwargs["torch_dtype"] = torch.bfloat16
+            if use_flash_attention:
+                kwargs["attn_implementation"] = "flash_attention_2"
         self.model = AutoModel.from_pretrained(model_path, **kwargs)
         # Disable KV cache — we only do forward/backward for embedding, no generation.
         # Without this, Qwen decoder still materializes past_key_values → extra activation memory.
@@ -216,6 +230,16 @@ def save_model(args, model_output_path, model, query_tokenizer, optimizer, sched
 def train(args):
     is_main_process = (args.n_gpu == 1) or (dist.get_rank() == 0)
 
+    # Fail fast on incompatible precision flags: fp32_master_weights forces sdpa
+    # (FA2 needs half-precision weights), so --use_flash_attention would be
+    # silently ignored. Hard-error instead of quietly changing the attention
+    # kernel (codex review #4).
+    if args.fp32_master_weights and args.use_flash_attention:
+        raise ValueError(
+            "--fp32_master_weights is incompatible with --use_flash_attention "
+            "(FlashAttention-2 requires half-precision weights; the fp32-master path "
+            "uses sdpa, which is numerically equivalent). Drop --use_flash_attention.")
+
     # 0. Pre-encoded pos/neg/oracle embeddings
     if args.pos_neg_embedding_file is not None:
         sample_emb_table = torch.load(args.pos_neg_embedding_file, map_location="cpu")
@@ -225,6 +249,7 @@ def train(args):
         model_path         = args.pretrained_encoder_path,
         use_flash_attention = args.use_flash_attention,
         use_bf16           = args.use_bf16,
+        fp32_master_weights = args.fp32_master_weights,
     ).to(args.device)
 
     raw_tokenizer  = AutoTokenizer.from_pretrained(args.pretrained_encoder_path,
@@ -409,9 +434,14 @@ def train(args):
         ckpt = args.resume_from_checkpoint
         # Load inner Qwen3 model via AutoModel (avoids key-prefix issues from QwenQueryEncoder wrapper)
         model_core = query_encoder.module if hasattr(query_encoder, "module") else query_encoder
-        model_core.model = AutoModel.from_pretrained(ckpt, trust_remote_code=True,
-                                                     torch_dtype=torch.bfloat16 if args.use_bf16 else torch.float32,
-                                                     **( {"attn_implementation": "flash_attention_2"} if args.use_flash_attention else {}))
+        if args.fp32_master_weights:
+            # Mirror the initial-load fp32-master path: fp32 weights + sdpa.
+            model_core.model = AutoModel.from_pretrained(ckpt, trust_remote_code=True,
+                                                         attn_implementation="sdpa")
+        else:
+            model_core.model = AutoModel.from_pretrained(ckpt, trust_remote_code=True,
+                                                         torch_dtype=torch.bfloat16 if args.use_bf16 else torch.float32,
+                                                         **( {"attn_implementation": "flash_attention_2"} if args.use_flash_attention else {}))
         model_core.model = model_core.model.to(args.device)
         model_core.model.config.use_cache = False  # consistent with initial load
         optimizer.load_state_dict(torch.load(oj(ckpt, "optimizer.pt"), map_location="cpu"))
@@ -510,8 +540,14 @@ def train(args):
                 current_loader.sampler.set_epoch(epoch)
             batch_iter = iter(current_loader)
 
+        # fp32_master_weights IMPLIES bf16 autocast for the forward/loss: the whole
+        # point is "fp32 master + bf16 matmuls" (the official DeepSpeed-ZeRO bf16
+        # numerics). Without this, `--fp32_master_weights` alone (no `--use_bf16`)
+        # would silently run a full-fp32 forward — slower, more memory, and NOT the
+        # intended numeric path (codex review #2).
         autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
-                        if args.use_bf16 else contextlib.nullcontext())
+                        if (args.use_bf16 or args.fp32_master_weights)
+                        else contextlib.nullcontext())
 
         optimizer.zero_grad(set_to_none=True)
         n_batches = micro_steps_per_epoch
@@ -838,6 +874,13 @@ def get_args():
     # Memory / speed
     parser.add_argument("--use_flash_attention", action="store_true")
     parser.add_argument("--use_bf16", action="store_true")
+    parser.add_argument("--fp32_master_weights", action="store_true",
+                        help="Keep fp32 master weights + fp32 AdamW moments (load model in "
+                             "fp32 + sdpa attention) while using autocast(bf16) for compute. "
+                             "Reproduces the official DeepSpeed-ZeRO bf16 numerics and avoids "
+                             "pure-bf16's update-rounding floor (lr=1e-5 steps fall below bf16 "
+                             "ULP for |theta|>=0.0026). Incompatible with --use_flash_attention "
+                             "(FA2 needs half-precision weights); sdpa is used instead.")
     parser.add_argument("--use_tf32", action="store_true")
     parser.add_argument("--use_fused_optimizer", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
