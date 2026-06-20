@@ -143,3 +143,23 @@ Analysis results (turn distribution, dataset stats, etc.) are saved to:
 15. **Check GPUs before running**: Before any GPU job, check `nvidia-smi` to see if GPUs are
     in use. If occupied, report the process info (pid, user, memory usage), guess what it is,
     and ask the user whether to kill it.
+
+16. **Log EVERY experiment in the model registry** (standing rule, 2026-06-18): whenever you
+    launch any training/fine-tuning run, ADD it to `docs/MODEL_REGISTRY.md` — its run name,
+    family, recipe (template / precision / GPUs×batch / loss / LR / negatives), launcher,
+    wandb project, and ckpt path `huggingface/continual_ir/<run>/`. Keep the registry current
+    so the ~100-dir sprawl stays navigable. The ground truth for any run's exact args is its
+    startup log (`grep -m1 "Args: Namespace" logs/run_<name>_*.log`). See the doc + skill
+    `continual-ir-model-registry` + memory `project_continual_ir_model_registry`.
+
+17. **IR experiments + paper writing — clean protocol** (standing rule, 2026-06-20): before
+    running sweeps/ablations or writing them up, follow skill `ir-experiment-and-paper`. Core
+    rules: (a) ablation = leave-one-out with all OTHER hyperparameters FIXED, kept SEPARATE from
+    the cumulative build-up table — never a mixed "ablation of ours" bag; (b) model selection on
+    FULL-corpus retrieval ONLY (the pool-rerank proxy is anti-correlated; never select on it);
+    (c) log every run's config + full-corpus result immediately, never stitch an ablation from
+    cross-round runs whose configs differ in several places; (d) trace every number to (run,
+    metric, dataset, epoch) before quoting — don't fabricate a selection rationale (the
+    QReCC 0.48-vs-0.546 in-batch-CE-vs-InfoNCE lesson); (e) paper structure = Dataset → Method →
+    Experiments (ablation goes in Experiments, not Method), with loss formulas + citations for
+    every borrowed method, unified terminology, and no internal codenames (e.g. `perso_dense_val`).
