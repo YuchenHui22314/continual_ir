@@ -59,6 +59,13 @@ CONSTLR = {
     "qrecc":    f"{FIG}/qrecc_per_epoch_infonce_v3.json",
 }
 RUN_CONSTLR = "instruct3fp32infonce_qwen_constlr"
+# 6e-6 constant-LR variant (smaller LR -> tamer late-epoch oscillation than the 1e-5 const run).
+CONSTLR6 = {
+    "topiocqa": f"{FIG}/constlr_lr6e6_topiocqa_per_epoch.json",
+    "msmarco":  f"{FIG}/constlr_lr6e6_msmarco_per_epoch.json",
+    "qrecc":    f"{FIG}/qrecc_per_epoch_infonce_v3.json",
+}
+RUN_CONSTLR6 = "instruct3fp32infonce_qwen_constlr_lr6e6"
 
 def load(p):
     try:
@@ -79,7 +86,8 @@ plt.rcParams.update({
 C_1E5, C_6E6, C_OLD = "#1f77b4", "#e8306a", "#9e9e9e"
 C_NS = "#2ca02c"   # in-batch CE + fp32-master, 4x120 (aligned isolation run)
 C_B4 = "#9467bd"   # InfoNCE bf16_fp32_master, 4x120 (B) — the canonical official-aligned run
-C_CONST = "#ff7f0e"  # InfoNCE 4x120, CONSTANT LR (schedule ablation of B)
+C_CONST = "#ff7f0e"  # InfoNCE 4x120, CONSTANT LR 1e-5 (schedule ablation of B)
+C_CONST6 = "#8c564b"  # InfoNCE 4x120, CONSTANT LR 6e-6 (smaller LR, tamer oscillation)
 
 # ---------------------------------------------------------------- 3-panel curves
 data = {k: load(v) for k, v in NEW.items()}
@@ -87,6 +95,7 @@ old  = {k: load(v) for k, v in OLD.items()}
 ns   = {k: load(v) for k, v in NOSCHED.items()}
 b4   = {k: load(v) for k, v in B4.items()}
 cst  = {k: load(v) for k, v in CONSTLR.items()}
+cst6 = {k: load(v) for k, v in CONSTLR6.items()}
 panels = [("topiocqa", "TopiOCQA (new task)"),
           ("msmarco",  "MS MARCO (previous task)"),
           ("qrecc",    "QReCC (held-out conv.)")]
@@ -107,6 +116,10 @@ for ax, (key, title) in zip(axes, panels):
     xc, yc = series(cst.get(key, {}), RUN_CONSTLR)
     if yc: ax.plot(xc, yc, color=C_CONST, lw=2.4, marker="D", ms=3.5,
                    label="InfoNCE (4x120) lr=1e-5 const", zorder=6)
+    # 6e-6 constant-LR variant: smaller LR, expected tamer late-epoch oscillation than 1e-5 const.
+    xc6, yc6 = series(cst6.get(key, {}), RUN_CONSTLR6)
+    if yc6: ax.plot(xc6, yc6, color=C_CONST6, lw=2.4, marker="v", ms=3.5,
+                    label="InfoNCE (4x120) lr=6e-6 const", zorder=7)
     # aligned isolation run: in-batch CE + fp32-master at the EXACT 4x120 main setting
     # (only precision differs from the bf16 main below) — the clean precision comparison.
     xn, yn = series(ns.get(key, {}), NOSCHED_REF)
@@ -167,6 +180,6 @@ for run in (RUN_1E5, RUN_6E6):
 # schedule ablation — B (cosine) vs const, 3-panel only (no BEIR for these two)
 print("\nSchedule ablation (4x120 InfoNCE, step-1880):")
 _last = lambda v: v[-1] if v else float('nan')
-for run, src in [(RUN_4X120, b4), (RUN_CONSTLR, cst)]:
+for run, src in [(RUN_4X120, b4), (RUN_CONSTLR, cst), (RUN_CONSTLR6, cst6)]:
     t = series(src['topiocqa'], run)[1]; m = series(src['msmarco'], run)[1]; q = series(src.get('qrecc', {}), run)[1]
     print(f"  {run}: TopiOCQA {_last(t):.4f}  MSMARCO {_last(m):.4f}  QReCC {_last(q):.4f}")

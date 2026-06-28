@@ -13,12 +13,13 @@
 # Usage:  ./run_qwen_infonce_4x120_constlr.sh [learning_rate]   (default 1e-5)
 set -u
 LR="${1:-1e-5}"
+LRTAG="lr$(echo "$LR" | tr -cd '0-9a-zA-Z')"   # 6e-6 -> lr6e6, 1e-5 -> lr1e5 (防覆盖). NOTE: the historical 1e-5 run is the un-tagged dir instruct3fp32infonce_qwen_constlr.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="${SCRIPT_DIR}/../src/train_qwen_cl.py"
 TORCHRUN=/data/rech/huiyuche/envs/trec_ikat/bin/torchrun
 TS=$(date +%Y%m%d_%H%M%S)
 LOG_DIR=/data/rech/huiyuche/TREC_iKAT_2024/logs
-RUN_NAME="instruct3fp32infonce_qwen_constlr"
+RUN_NAME="instruct3fp32infonce_qwen_constlr_${LRTAG}"
 RUN_LOG=${LOG_DIR}/run_${RUN_NAME}_${TS}.log
 PRETRAIN=/data/rech/huiyuche/huggingface/models--Qwen--Qwen3-Embedding-0.6B/snapshots/c54f2e6e80b2d7b7de06f51cec4959f6b3e03418
 TRAIN_FILE=/data/rech/huiyuche/TREC_iKAT_2024/data/topics/topiocqa/topiocqa_train_oracle.jsonl
