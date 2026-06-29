@@ -20,6 +20,8 @@
 # (invalid <|im_end|> wrapper numbers; offline eval after); NO --record_grad_stats.
 # Sequential — each run uses all 4 GPUs. ~4h/run x 7 ~= 28h.
 set -u
+LR="${1:-6e-6}"   # 6e-6 chosen over 1e-5 (2026-06-28): steadier late epochs + higher final on all 3 axes + least MS MARCO forgetting.
+LRTAG="lr$(echo "$LR" | tr -cd '0-9a-zA-Z')"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="${SCRIPT_DIR}/../src/train_qwen_cl.py"
@@ -47,11 +49,11 @@ RUNS=(
 )
 
 echo "===== 7 InfoNCE-constlr curriculum runs kickoff $(date) =====" | tee -a "$MASTER_LOG"
-echo "recipe: InfoNCE 4x120 (480 cross-GPU negs) tau=0.01 + mask_fake_neg(0.1) + dedup | CONSTANT LR 1e-5 (--no_lr_schedule) | adam_beta2=0.95 | bf16_fp32_master+FA2 | v3 | 20ep | NO in-training eval | NO grad_stats" | tee -a "$MASTER_LOG"
+echo "recipe: InfoNCE 4x120 (480 cross-GPU negs) tau=0.01 + mask_fake_neg(0.1) + dedup | CONSTANT LR $LR (--no_lr_schedule) | adam_beta2=0.95 | bf16_fp32_master+FA2 | v3 | 20ep | NO in-training eval | NO grad_stats" | tee -a "$MASTER_LOG"
 
 for entry in "${RUNS[@]}"; do
   IFS='|' read -r NAME CTYPE PACE <<< "$entry"
-  RUN_NAME="instruct3fp32infonce_constlr_${NAME}"
+  RUN_NAME="instruct3fp32infonce_constlr_${LRTAG}_${NAME}"
   RUN_LOG=${LOG_DIR}/run_${RUN_NAME}_${TS}.log
   echo "===== [$(date)] START $RUN_NAME (curriculum=$CTYPE, pacing=$PACE) =====" | tee -a "$MASTER_LOG"
 
@@ -71,7 +73,7 @@ for entry in "${RUNS[@]}"; do
     --num_train_epochs 20 \
     --per_gpu_train_batch_size 120 \
     --gradient_accumulation_steps 1 \
-    --learning_rate 1e-5 \
+    --learning_rate "$LR" \
     --no_lr_schedule \
     --adam_beta2 0.95 \
     --loss_type ranking \
